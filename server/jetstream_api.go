@@ -16,12 +16,12 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"path"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -256,6 +256,9 @@ const (
 	JSAuditAdvisory = "$JS.EVENT.ADVISORY.API"
 )
 
+// JSMaxDescription is the maximum description length for streams and consumers.
+const JSMaxDescriptionLen = 4 * 1024
+
 // JSMaxNameLen is the maximum name lengths for streams, consumers and templates.
 const JSMaxNameLen = 256
 
@@ -302,6 +305,7 @@ const JSApiAccountInfoResponseType = "io.nats.jetstream.api.v1.account_info_resp
 type JSApiStreamCreateResponse struct {
 	ApiResponse
 	*StreamInfo
+	DidCreate bool `json:"did_create,omitempty"`
 }
 
 const JSApiStreamCreateResponseType = "io.nats.jetstream.api.v1.stream_create_response"
@@ -596,19 +600,23 @@ type JSApiStreamTemplateNamesResponse struct {
 
 const JSApiStreamTemplateNamesResponseType = "io.nats.jetstream.api.v1.stream_template_names_response"
 
-func (js *jetStream) apiDispatch(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+// Default max API calls outstanding.
+const defaultMaxJSApiOut = int64(4096)
+
+// Max API calls outstanding.
+var maxJSApiOut = defaultMaxJSApiOut
+
+func (js *jetStream) apiDispatch(sub *subscription, c *client, acc *Account, subject, reply string, rmsg []byte) {
 	hdr, _ := c.msgParts(rmsg)
 	if len(getHeader(ClientInfoHdr, hdr)) == 0 {
 		return
 	}
 	js.mu.RLock()
-	s := js.srv
-	rr := js.apiSubs.Match(subject)
+	s, rr := js.srv, js.apiSubs.Match(subject)
 	js.mu.RUnlock()
 
 	// Shortcircuit.
 	if len(rr.psubs)+len(rr.qsubs) == 0 {
-		debug.PrintStack()
 		return
 	}
 
@@ -621,19 +629,19 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, subject, reply st
 	jsub := rr.psubs[0]
 
 	// If this is directly from a client connection ok to do in place.
-	if c.kind == CLIENT {
-		jsub.icb(sub, c, subject, reply, rmsg)
+	if c.kind != ROUTER && c.kind != GATEWAY {
+		jsub.icb(sub, c, acc, subject, reply, rmsg)
 		return
 	}
 
 	// If we are here we have received this request over a non client connection.
 	// We need to make sure not to block. We will spin a Go routine per but also make
 	// sure we do not have too many outstanding.
-	if apiOut := atomic.AddInt64(&js.apiCalls, 1); apiOut > 1024 {
+	if apiOut := atomic.AddInt64(&js.apiCalls, 1); apiOut > maxJSApiOut {
 		atomic.AddInt64(&js.apiCalls, -1)
 		ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
 		if err == nil {
-			resp := &ApiResponse{Type: JSApiOverloadedType, Error: ApiErrors[JSInsufficientResourcesErr]}
+			resp := &ApiResponse{Type: JSApiOverloadedType, Error: NewJSInsufficientResourcesError()}
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		} else {
 			s.Warnf(badAPIRequestT, rmsg)
@@ -654,7 +662,7 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, subject, reply st
 
 	// Dispatch the API call to its own Go routine.
 	go func() {
-		jsub.icb(sub, client, subject, reply, rmsg)
+		jsub.icb(sub, client, acc, subject, reply, rmsg)
 		atomic.AddInt64(&js.apiCalls, -1)
 	}()
 }
@@ -662,7 +670,7 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, subject, reply st
 func (s *Server) setJetStreamExportSubs() error {
 	js := s.getJetStream()
 	if js == nil {
-		return ApiErrors[JSNotEnabledErr]
+		return NewJSNotEnabledError()
 	}
 
 	// This is the catch all now for all JetStream API calls.
@@ -827,10 +835,11 @@ func (a *Account) checkJetStream() (enabled, shouldError bool) {
 }
 
 // Request for current usage and limits for this account.
-func (s *Server) jsAccountInfoRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsAccountInfoRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
+
 	ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
 	if err != nil {
 		s.Warnf(badAPIRequestT, msg)
@@ -846,7 +855,7 @@ func (s *Server) jsAccountInfoRequest(sub *subscription, c *client, subject, rep
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -860,7 +869,7 @@ func (s *Server) jsAccountInfoRequest(sub *subscription, c *client, subject, rep
 		if !doErr {
 			return
 		}
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 	} else {
 		stats := acc.JetStreamUsage()
 		resp.JetStreamAccountStats = &stats
@@ -887,7 +896,7 @@ func consumerNameFromSubject(subject string) string {
 }
 
 // Request to create a new template.
-func (s *Server) jsTemplateCreateRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsTemplateCreateRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil {
 		return
 	}
@@ -899,34 +908,34 @@ func (s *Server) jsTemplateCreateRequest(sub *subscription, c *client, subject, 
 
 	var resp = JSApiStreamTemplateCreateResponse{ApiResponse: ApiResponse{Type: JSApiStreamTemplateCreateResponseType}}
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	// Not supported for now.
 	if s.JetStreamIsClustered() {
-		resp.Error = ApiErrors[JSClusterUnSupportFeatureErr]
+		resp.Error = NewJSClusterUnSupportFeatureError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	var cfg StreamTemplateConfig
 	if err := json.Unmarshal(msg, &cfg); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	templateName := templateNameFromSubject(subject)
 	if templateName != cfg.Name {
-		resp.Error = ApiErrors[JSTemplateNameNotMatchSubjectErr]
+		resp.Error = NewJSTemplateNameNotMatchSubjectError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	t, err := acc.addStreamTemplate(&cfg)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamTemplateCreateErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamTemplateCreateError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -942,7 +951,7 @@ func (s *Server) jsTemplateCreateRequest(sub *subscription, c *client, subject, 
 }
 
 // Request for the list of all template names.
-func (s *Server) jsTemplateNamesRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsTemplateNamesRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil {
 		return
 	}
@@ -954,14 +963,14 @@ func (s *Server) jsTemplateNamesRequest(sub *subscription, c *client, subject, r
 
 	var resp = JSApiStreamTemplateNamesResponse{ApiResponse: ApiResponse{Type: JSApiStreamTemplateNamesResponseType}}
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	// Not supported for now.
 	if s.JetStreamIsClustered() {
-		resp.Error = ApiErrors[JSClusterUnSupportFeatureErr]
+		resp.Error = NewJSClusterUnSupportFeatureError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -970,7 +979,7 @@ func (s *Server) jsTemplateNamesRequest(sub *subscription, c *client, subject, r
 	if !isEmptyRequest(msg) {
 		var req JSApiStreamTemplatesRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1006,7 +1015,7 @@ func (s *Server) jsTemplateNamesRequest(sub *subscription, c *client, subject, r
 }
 
 // Request for information about a stream template.
-func (s *Server) jsTemplateInfoRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsTemplateInfoRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil {
 		return
 	}
@@ -1018,19 +1027,19 @@ func (s *Server) jsTemplateInfoRequest(sub *subscription, c *client, subject, re
 
 	var resp = JSApiStreamTemplateInfoResponse{ApiResponse: ApiResponse{Type: JSApiStreamTemplateInfoResponseType}}
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSNotEmptyRequestErr]
+		resp.Error = NewJSNotEmptyRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	name := templateNameFromSubject(subject)
 	t, err := acc.lookupStreamTemplate(name)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamTemplateNotFoundErr]
+		resp.Error = NewJSStreamTemplateNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1047,7 +1056,7 @@ func (s *Server) jsTemplateInfoRequest(sub *subscription, c *client, subject, re
 }
 
 // Request to delete a stream template.
-func (s *Server) jsTemplateDeleteRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsTemplateDeleteRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil {
 		return
 	}
@@ -1059,19 +1068,19 @@ func (s *Server) jsTemplateDeleteRequest(sub *subscription, c *client, subject, 
 
 	var resp = JSApiStreamTemplateDeleteResponse{ApiResponse: ApiResponse{Type: JSApiStreamTemplateDeleteResponseType}}
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSNotEmptyRequestErr]
+		resp.Error = NewJSNotEmptyRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	name := templateNameFromSubject(subject)
 	err = acc.deleteStreamTemplate(name)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamTemplateDeleteErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamTemplateDeleteError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1089,7 +1098,7 @@ func (s *Server) jsonResponse(v interface{}) string {
 }
 
 // Request to create a stream.
-func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, a *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1108,7 +1117,7 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1120,20 +1129,21 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	var cfg StreamConfig
 	if err := json.Unmarshal(msg, &cfg); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+
 	streamName := streamNameFromSubject(subject)
 	if streamName != cfg.Name {
-		resp.Error = ApiErrors[JSStreamMismatchErr]
+		resp.Error = NewJSStreamMismatchError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1167,22 +1177,22 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 	// Do some pre-checking for mirror config to avoid cycles in clustered mode.
 	if cfg.Mirror != nil {
 		if len(cfg.Subjects) > 0 {
-			resp.Error = ApiErrors[JSMirrorWithSubjectsErr]
+			resp.Error = NewJSMirrorWithSubjectsError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		if len(cfg.Sources) > 0 {
-			resp.Error = ApiErrors[JSMirrorWithSourcesErr]
+			resp.Error = NewJSMirrorWithSourcesError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		if cfg.Mirror.FilterSubject != _EMPTY_ {
-			resp.Error = ApiErrors[JSMirrorWithSubjectFiltersErr]
+			resp.Error = NewJSMirrorWithSubjectFiltersError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		if cfg.Mirror.OptStartSeq > 0 && cfg.Mirror.OptStartTime != nil {
-			resp.Error = ApiErrors[JSMirrorWithStartSeqAndTimeErr]
+			resp.Error = NewJSMirrorWithStartSeqAndTimeError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1197,7 +1207,7 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 			streamSubs = append(streamSubs, subs...)
 		}
 		if exists && cfg.MaxMsgSize > 0 && maxMsgSize > 0 && cfg.MaxMsgSize < maxMsgSize {
-			resp.Error = ApiErrors[JSMirrorMaxMessageSizeTooBigErr]
+			resp.Error = NewJSMirrorMaxMessageSizeTooBigError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1226,7 +1236,7 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 				apiPrefixes = append(apiPrefixes, src.External.ApiPrefix)
 			}
 			if exists && cfg.MaxMsgSize > 0 && maxMsgSize > 0 && cfg.MaxMsgSize < maxMsgSize {
-				resp.Error = ApiErrors[JSSourceMaxMessageSizeTooBigErr]
+				resp.Error = NewJSSourceMaxMessageSizeTooBigError()
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				return
 			}
@@ -1235,13 +1245,13 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 	// check prefix overlap with subjects
 	for _, pfx := range deliveryPrefixes {
 		if !IsValidPublishSubject(pfx) {
-			resp.Error = ApiErrors[JSStreamInvalidExternalDeliverySubjErrF].NewT("{prefix}", pfx)
+			resp.Error = NewJSStreamInvalidExternalDeliverySubjError(pfx)
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		for _, sub := range streamSubs {
 			if SubjectsCollide(sub, fmt.Sprintf("%s.%s", pfx, sub)) {
-				resp.Error = ApiErrors[JSStreamExternalDelPrefixOverlapsErrF].NewT("{prefix}", pfx, "{subject}", sub)
+				resp.Error = NewJSStreamExternalDelPrefixOverlapsError(pfx, sub)
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				return
 			}
@@ -1255,7 +1265,7 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 			return
 		}
 		if SubjectsCollide(apiPfx, JSApiPrefix) {
-			resp.Error = ApiErrors[JSStreamExternalApiOverlapErrF].NewT("{prefix}", apiPfx, "{subject}", JSApiPrefix)
+			resp.Error = NewJSStreamExternalApiOverlapError(apiPfx, JSApiPrefix)
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1268,16 +1278,17 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, subject, re
 
 	mset, err := acc.addStream(&cfg)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamCreateErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamCreateError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	resp.StreamInfo = &StreamInfo{Created: mset.createdTime(), State: mset.state(), Config: mset.config()}
+	resp.DidCreate = true
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
 // Request to update a stream.
-func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1297,7 +1308,7 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, subject, re
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1309,28 +1320,28 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, subject, re
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	var ncfg StreamConfig
 	if err := json.Unmarshal(msg, &ncfg); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	cfg, err := checkStreamCfg(&ncfg)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamInvalidConfigF].NewT("{err}", err)
+		resp.Error = NewJSStreamInvalidConfigError(err)
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	streamName := streamNameFromSubject(subject)
 	if streamName != cfg.Name {
-		resp.Error = ApiErrors[JSStreamMismatchErr]
+		resp.Error = NewJSStreamMismatchError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1342,13 +1353,13 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, subject, re
 
 	mset, err := acc.lookupStream(streamName)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	if err := mset.update(&cfg); err != nil {
-		resp.Error = ApiErrors[JSStreamUpdateErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamUpdateError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1360,7 +1371,7 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, subject, re
 }
 
 // Request for the list of all stream names.
-func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1379,7 +1390,7 @@ func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, rep
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1391,7 +1402,7 @@ func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, rep
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -1403,7 +1414,7 @@ func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, rep
 	if !isEmptyRequest(msg) {
 		var req JSApiStreamNamesRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1424,7 +1435,7 @@ func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, rep
 		}
 		js.mu.RLock()
 		for stream, sa := range cc.streams[acc.Name] {
-			if sa.err == ApiErrors[JSClusterNotAssignedErr] {
+			if IsNatsErr(sa.err, JSClusterNotAssignedErr) {
 				continue
 			}
 			if filter != _EMPTY_ {
@@ -1484,7 +1495,7 @@ func (s *Server) jsStreamNamesRequest(sub *subscription, c *client, subject, rep
 
 // Request for the list of all detailed stream info.
 // TODO(dlc) - combine with above long term
-func (s *Server) jsStreamListRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamListRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1506,7 +1517,7 @@ func (s *Server) jsStreamListRequest(sub *subscription, c *client, subject, repl
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1518,7 +1529,7 @@ func (s *Server) jsStreamListRequest(sub *subscription, c *client, subject, repl
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -1528,7 +1539,7 @@ func (s *Server) jsStreamListRequest(sub *subscription, c *client, subject, repl
 	if !isEmptyRequest(msg) {
 		var req JSApiStreamNamesRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1574,11 +1585,11 @@ func (s *Server) jsStreamListRequest(sub *subscription, c *client, subject, repl
 }
 
 // Request for information about a stream.
-func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, a *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
-	ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
 	if err != nil {
 		s.Warnf(badAPIRequestT, msg)
 		return
@@ -1587,6 +1598,12 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 	streamName := streamNameFromSubject(subject)
 
 	var resp = JSApiStreamInfoResponse{ApiResponse: ApiResponse{Type: JSApiStreamInfoResponseType}}
+
+	// If someone creates a duplicate stream that is identical we will get this request forwarded to us.
+	// Make sure the response type is for a create call.
+	if rt := getHeader(JSResponseType, hdr); len(rt) > 0 && string(rt) == jsCreateResponse {
+		resp.ApiResponse.Type = JSApiStreamCreateResponseType
+	}
 
 	// If we are in clustered mode we need to be the stream leader to proceed.
 	if s.JetStreamIsClustered() {
@@ -1604,18 +1621,18 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 			// We can't find the stream, so mimic what would be the errors below.
 			if hasJS, doErr := acc.checkJetStream(); !hasJS {
 				if doErr {
-					resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+					resp.Error = NewJSNotEnabledForAccountError()
 					s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				}
 				return
 			}
 			// No stream present.
-			resp.Error = ApiErrors[JSStreamNotFoundErr]
+			resp.Error = NewJSStreamNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		} else if sa == nil {
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				// Delaying an error response gives the leader a chance to respond before us
 				s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), nil)
 			}
@@ -1628,7 +1645,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 		// We have the stream assigned and a leader, so only the stream leader should answer.
 		if !acc.JetStreamIsStreamLeader(streamName) && !isLeaderless {
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				// Delaying an error response gives the leader a chance to respond before us
 				s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), sa.Group)
 			}
@@ -1638,7 +1655,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -1648,7 +1665,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 	if !isEmptyRequest(msg) {
 		var req JSApiStreamInfoRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -1657,7 +1674,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 
 	mset, err := acc.lookupStream(streamName)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1669,6 +1686,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 		Created: mset.createdTime(),
 		State:   mset.stateWithDetail(details),
 		Config:  config,
+		Domain:  s.getOpts().JetStreamDomain,
 		Cluster: js.clusterInfo(mset.raftGroup()),
 	}
 	if mset.isMirror() {
@@ -1686,7 +1704,7 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 }
 
 // Request to have a stream leader stepdown.
-func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1703,7 +1721,7 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, sub
 
 	// If we are not in clustered mode this is a failed request.
 	if !s.JetStreamIsClustered() {
-		resp.Error = ApiErrors[JSClusterRequiredErr]
+		resp.Error = NewJSClusterRequiredError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1714,7 +1732,7 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, sub
 		return
 	}
 	if js.isLeaderless() {
-		resp.Error = ApiErrors[JSClusterNotAvailErr]
+		resp.Error = NewJSClusterNotAvailError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1724,7 +1742,7 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, sub
 	js.mu.RUnlock()
 
 	if isLeader && sa == nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr]
+		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	} else if sa == nil {
@@ -1733,20 +1751,20 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, sub
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	// Check to see if we are a member of the group and if the group has no leader.
 	if js.isGroupLeaderless(sa.Group) {
-		resp.Error = ApiErrors[JSClusterNotAvailErr]
+		resp.Error = NewJSClusterNotAvailError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1758,7 +1776,7 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, sub
 
 	mset, err := acc.lookupStream(name)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1775,7 +1793,7 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, sub
 }
 
 // Request to have a consumer leader stepdown.
-func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1789,7 +1807,7 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, s
 
 	// If we are not in clustered mode this is a failed request.
 	if !s.JetStreamIsClustered() {
-		resp.Error = ApiErrors[JSClusterRequiredErr]
+		resp.Error = NewJSClusterRequiredError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1800,7 +1818,7 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, s
 		return
 	}
 	if js.isLeaderless() {
-		resp.Error = ApiErrors[JSClusterNotAvailErr]
+		resp.Error = NewJSClusterNotAvailError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1814,7 +1832,7 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, s
 	js.mu.RUnlock()
 
 	if isLeader && sa == nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr]
+		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	} else if sa == nil {
@@ -1825,13 +1843,13 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, s
 		ca = sa.consumers[consumer]
 	}
 	if ca == nil {
-		resp.Error = ApiErrors[JSConsumerNotFoundErr]
+		resp.Error = NewJSConsumerNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	// Check to see if we are a member of the group and if the group has no leader.
 	if js.isGroupLeaderless(ca.Group) {
-		resp.Error = ApiErrors[JSClusterNotAvailErr]
+		resp.Error = NewJSClusterNotAvailError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1842,26 +1860,26 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, s
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr]
+		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	o := mset.lookupConsumer(consumer)
 	if o == nil {
-		resp.Error = ApiErrors[JSConsumerNotFoundErr]
+		resp.Error = NewJSConsumerNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1874,7 +1892,7 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, s
 }
 
 // Request to remove a peer from a clustered stream.
-func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -1891,7 +1909,7 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, subject
 
 	// If we are not in clustered mode this is a failed request.
 	if !s.JetStreamIsClustered() {
-		resp.Error = ApiErrors[JSClusterRequiredErr]
+		resp.Error = NewJSClusterRequiredError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1902,7 +1920,7 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, subject
 		return
 	}
 	if js.isLeaderless() {
-		resp.Error = ApiErrors[JSClusterNotAvailErr]
+		resp.Error = NewJSClusterNotAvailError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1918,32 +1936,32 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, subject
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	var req JSApiStreamRemovePeerRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	if req.Peer == _EMPTY_ {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	if sa == nil {
 		// No stream present.
-		resp.Error = ApiErrors[JSStreamNotFoundErr]
+		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1959,14 +1977,14 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, subject
 
 	// Make sure we are a member.
 	if !isMember {
-		resp.Error = ApiErrors[JSClusterPeerNotMemberErr]
+		resp.Error = NewJSClusterPeerNotMemberError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	// If we are here we have a valid peer member set for removal.
 	if !js.removePeerFromStream(sa, nodeName) {
-		resp.Error = ApiErrors[JSPeerRemapErr]
+		resp.Error = NewJSPeerRemapError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -1976,7 +1994,7 @@ func (s *Server) jsStreamRemovePeerRequest(sub *subscription, c *client, subject
 }
 
 // Request to have the metaleader remove a peer from the system.
-func (s *Server) jsLeaderServerRemoveRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsLeaderServerRemoveRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2004,14 +2022,14 @@ func (s *Server) jsLeaderServerRemoveRequest(sub *subscription, c *client, subje
 	var resp = JSApiMetaServerRemoveResponse{ApiResponse: ApiResponse{Type: JSApiMetaServerRemoveResponseType}}
 
 	if isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	var req JSApiMetaServerRemoveRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2028,7 +2046,7 @@ func (s *Server) jsLeaderServerRemoveRequest(sub *subscription, c *client, subje
 	js.mu.RUnlock()
 
 	if found == _EMPTY_ {
-		resp.Error = ApiErrors[JSClusterServerNotMemberErr]
+		resp.Error = NewJSClusterServerNotMemberError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2044,7 +2062,7 @@ func (s *Server) jsLeaderServerRemoveRequest(sub *subscription, c *client, subje
 
 // Request to have the meta leader stepdown.
 // These will only be received the the meta leaders, so less checking needed.
-func (s *Server) jsLeaderStepDownRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsLeaderStepDownRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2075,13 +2093,13 @@ func (s *Server) jsLeaderStepDownRequest(sub *subscription, c *client, subject, 
 	if !isEmptyRequest(msg) {
 		var req JSApiLeaderStepdownRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		if len(req.Placement.Tags) > 0 {
 			// Tags currently not supported.
-			resp.Error = ApiErrors[JSClusterTagsErr]
+			resp.Error = NewJSClusterTagsError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2097,7 +2115,7 @@ func (s *Server) jsLeaderStepDownRequest(sub *subscription, c *client, subject, 
 			}
 		}
 		if len(peers) == 0 {
-			resp.Error = ApiErrors[JSClusterNoPeersErr]
+			resp.Error = NewJSClusterNoPeersError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2111,7 +2129,7 @@ func (s *Server) jsLeaderStepDownRequest(sub *subscription, c *client, subject, 
 	// Call actual stepdown.
 	err = cc.meta.StepDown(preferredLeader)
 	if err != nil {
-		resp.Error = ApiErrors[JSRaftGeneralErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSRaftGeneralError(err, Unless(err))
 	} else {
 		resp.Success = true
 	}
@@ -2138,7 +2156,7 @@ func isEmptyRequest(req []byte) bool {
 }
 
 // Request to delete a stream.
-func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2157,7 +2175,7 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, subject, re
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2169,14 +2187,14 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, subject, re
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 
 	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSNotEmptyRequestErr]
+		resp.Error = NewJSNotEmptyRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2190,13 +2208,13 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, subject, re
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	if err := mset.delete(); err != nil {
-		resp.Error = ApiErrors[JSStreamDeleteErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamDeleteError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2206,7 +2224,7 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, subject, re
 
 // Request to delete a message.
 // This expects a stream sequence number as the msg body.
-func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2228,7 +2246,7 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2241,13 +2259,13 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 			// We can't find the stream, so mimic what would be the errors below.
 			if hasJS, doErr := acc.checkJetStream(); !hasJS {
 				if doErr {
-					resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+					resp.Error = NewJSNotEnabledForAccountError()
 					s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				}
 				return
 			}
 			// No stream present.
-			resp.Error = ApiErrors[JSStreamNotFoundErr]
+			resp.Error = NewJSStreamNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		} else if sa == nil {
@@ -2256,7 +2274,7 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 
 		// Check to see if we are a member of the group and if the group has no leader.
 		if js.isGroupLeaderless(sa.Group) {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2269,26 +2287,36 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	var req JSApiMsgDeleteRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.cfg.Sealed {
+		resp.Error = NewJSStreamSealedError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.cfg.DenyDelete {
+		resp.Error = NewJSStreamMsgDeleteFailedError(errors.New("message delete not permitted"))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2305,9 +2333,9 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 		removed, err = mset.eraseMsg(req.Seq)
 	}
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamMsgDeleteFailedF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamMsgDeleteFailedError(err, Unless(err))
 	} else if !removed {
-		resp.Error = ApiErrors[JSSequenceNotFoundErrF].NewT("{seq}", req.Seq)
+		resp.Error = NewJSSequenceNotFoundError(req.Seq)
 	} else {
 		resp.Success = true
 	}
@@ -2315,7 +2343,7 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 }
 
 // Request to get a raw stream message.
-func (s *Server) jsMsgGetRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsMsgGetRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2337,7 +2365,7 @@ func (s *Server) jsMsgGetRequest(sub *subscription, c *client, subject, reply st
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2350,13 +2378,13 @@ func (s *Server) jsMsgGetRequest(sub *subscription, c *client, subject, reply st
 			// We can't find the stream, so mimic what would be the errors below.
 			if hasJS, doErr := acc.checkJetStream(); !hasJS {
 				if doErr {
-					resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+					resp.Error = NewJSNotEnabledForAccountError()
 					s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				}
 				return
 			}
 			// No stream present.
-			resp.Error = ApiErrors[JSStreamNotFoundErr]
+			resp.Error = NewJSStreamNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		} else if sa == nil {
@@ -2365,7 +2393,7 @@ func (s *Server) jsMsgGetRequest(sub *subscription, c *client, subject, reply st
 
 		// Check to see if we are a member of the group and if the group has no leader.
 		if js.isGroupLeaderless(sa.Group) {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2378,49 +2406,50 @@ func (s *Server) jsMsgGetRequest(sub *subscription, c *client, subject, reply st
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	var req JSApiMsgGetRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	// Check that we do not have both options set.
 	if req.Seq > 0 && req.LastFor != _EMPTY_ || req.Seq == 0 && req.LastFor == _EMPTY_ {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr]
+		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	var subj string
 	var hdr []byte
+	var data []byte
 	var ts int64
 	seq := req.Seq
 
 	if req.Seq > 0 {
-		subj, hdr, msg, ts, err = mset.store.LoadMsg(req.Seq)
+		subj, hdr, data, ts, err = mset.store.LoadMsg(req.Seq)
 	} else {
-		subj, seq, hdr, msg, ts, err = mset.store.LoadLastMsg(req.LastFor)
+		subj, seq, hdr, data, ts, err = mset.store.LoadLastMsg(req.LastFor)
 	}
 	if err != nil {
-		resp.Error = ApiErrors[JSNoMessageFoundErr]
+		resp.Error = NewJSNoMessageFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2428,14 +2457,14 @@ func (s *Server) jsMsgGetRequest(sub *subscription, c *client, subject, reply st
 		Subject:  subj,
 		Sequence: seq,
 		Header:   hdr,
-		Data:     msg,
+		Data:     data,
 		Time:     time.Unix(0, ts).UTC(),
 	}
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
 // Request to purge a stream.
-func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2465,18 +2494,18 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 			// We can't find the stream, so mimic what would be the errors below.
 			if hasJS, doErr := acc.checkJetStream(); !hasJS {
 				if doErr {
-					resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+					resp.Error = NewJSNotEnabledForAccountError()
 					s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				}
 				return
 			}
 			// No stream present.
-			resp.Error = ApiErrors[JSStreamNotFoundErr]
+			resp.Error = NewJSStreamNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		} else if sa == nil {
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			}
 			return
@@ -2484,7 +2513,7 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 
 		// Check to see if we are a member of the group and if the group has no leader.
 		if js.isGroupLeaderless(sa.Group) {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2492,7 +2521,7 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 		// We have the stream assigned and a leader, so only the stream leader should answer.
 		if !acc.JetStreamIsStreamLeader(stream) {
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			}
 			return
@@ -2501,7 +2530,7 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -2511,12 +2540,12 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 	if !isEmptyRequest(msg) {
 		var req JSApiStreamPurgeRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		if req.Sequence > 0 && req.Keep > 0 {
-			resp.Error = ApiErrors[JSBadRequestErr]
+			resp.Error = NewJSBadRequestError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -2525,7 +2554,17 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.cfg.Sealed {
+		resp.Error = NewJSStreamSealedError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.cfg.DenyPurge {
+		resp.Error = NewJSStreamPurgeFailedError(errors.New("stream purge not permitted"))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2537,7 +2576,7 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 
 	purged, err := mset.purge(purgeRequest)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamGeneralErrorF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 	} else {
 		resp.Purged = purged
 		resp.Success = true
@@ -2546,7 +2585,7 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 }
 
 // Request to restore a stream.
-func (s *Server) jsStreamRestoreRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamRestoreRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamIsLeader() {
 		return
 	}
@@ -2558,19 +2597,19 @@ func (s *Server) jsStreamRestoreRequest(sub *subscription, c *client, subject, r
 
 	var resp = JSApiStreamRestoreResponse{ApiResponse: ApiResponse{Type: JSApiStreamRestoreResponseType}}
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	if isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	var req JSApiStreamRestoreRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -2587,14 +2626,14 @@ func (s *Server) jsStreamRestoreRequest(sub *subscription, c *client, subject, r
 	}
 
 	if _, err := acc.lookupStream(stream); err == nil {
-		resp.Error = ApiErrors[JSStreamNameExistErr]
+		resp.Error = NewJSStreamNameExistError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -2619,7 +2658,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 
 	tfile, err := ioutil.TempFile(snapDir, "js-restore-")
 	if err != nil {
-		resp.Error = ApiErrors[JSTempStorageFailedErr]
+		resp.Error = NewJSTempStorageFailedError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, msg, s.jsonResponse(&resp))
 		return nil
 	}
@@ -2655,7 +2694,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 	var total int
 
 	// FIXM(dlc) - Probably take out of network path eventually due to disk I/O?
-	processChunk := func(sub *subscription, c *client, subject, reply string, msg []byte) {
+	processChunk := func(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 		// We require reply subjects to communicate back failures, flow etc. If they do not have one log and cancel.
 		if reply == _EMPTY_ {
 			sub.client.processUnsub(sub.sid)
@@ -2689,7 +2728,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 		total += len(msg)
 		if js.wouldExceedLimits(FileStorage, total) {
 			s.resourcesExeededError()
-			resultCh <- result{ApiErrors[JSInsufficientResourcesErr], reply}
+			resultCh <- result{NewJSInsufficientResourcesError(), reply}
 			return
 		}
 
@@ -2711,7 +2750,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 	if err != nil {
 		tfile.Close()
 		os.Remove(tfile.Name())
-		resp.Error = ApiErrors[JSRestoreSubscribeFailedErrF].NewT("{subject}", restoreSubj, "{err}", err)
+		resp.Error = NewJSRestoreSubscribeFailedError(err, restoreSubj)
 		s.sendAPIErrResponse(ci, acc, subject, reply, msg, s.jsonResponse(&resp))
 		return nil
 	}
@@ -2774,7 +2813,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 				var resp = JSApiStreamCreateResponse{ApiResponse: ApiResponse{Type: JSApiStreamCreateResponseType}}
 
 				if err != nil {
-					resp.Error = ApiErrors[JSStreamRestoreErrF].ErrOrNewT(err, "{err}", err)
+					resp.Error = NewJSStreamRestoreError(err, Unless(err))
 					s.Warnf("Restore failed for %s for stream '%s > %s' in %v",
 						friendlyBytes(int64(total)), streamName, acc.Name, end.Sub(start))
 				} else {
@@ -2803,7 +2842,7 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 }
 
 // Process a snapshot request.
-func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -2823,26 +2862,26 @@ func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, subject, 
 
 	var resp = JSApiStreamSnapshotResponse{ApiResponse: ApiResponse{Type: JSApiStreamSnapshotResponseType}}
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 		return
 	}
 	if isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSBadRequestErr]
+		resp.Error = NewJSBadRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 		return
 	}
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 		return
 	}
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 		}
 		return
@@ -2850,12 +2889,12 @@ func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, subject, 
 
 	var req JSApiStreamSnapshotRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 		return
 	}
 	if !IsValidSubject(req.DeliverSubject) {
-		resp.Error = ApiErrors[JSSnapshotDeliverSubjectInvalidErr]
+		resp.Error = NewJSSnapshotDeliverSubjectInvalidError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 		return
 	}
@@ -2874,7 +2913,7 @@ func (s *Server) jsStreamSnapshotRequest(sub *subscription, c *client, subject, 
 		sr, err := mset.snapshot(0, req.CheckMsgs, !req.NoConsumers)
 		if err != nil {
 			s.Warnf("Snapshot of stream '%s > %s' failed: %v", mset.jsa.account.Name, mset.name(), err)
-			resp.Error = ApiErrors[JSStreamSnapshotErrF].ErrOrNewT(err, "{err}", err)
+			resp.Error = NewJSStreamSnapshotError(err, Unless(err))
 			s.sendAPIErrResponse(ci, acc, subject, reply, smsg, s.jsonResponse(&resp))
 			return
 		}
@@ -2961,7 +3000,7 @@ func (s *Server) streamSnapshot(ci *ClientInfo, acc *Account, mset *stream, sr *
 
 	// We will place sequence number and size of chunk sent in the reply.
 	ackSubj := fmt.Sprintf(jsSnapshotAckT, mset.name(), nuid.Next())
-	ackSub, _ := mset.subscribeInternalUnlocked(ackSubj+".>", func(_ *subscription, _ *client, subject, _ string, _ []byte) {
+	ackSub, _ := mset.subscribeInternalUnlocked(ackSubj+".>", func(_ *subscription, _ *client, _ *Account, subject, _ string, _ []byte) {
 		cs, _ := strconv.Atoi(tokenAt(subject, 6))
 		// This is very crude and simple, but ok for now.
 		// This only matters when sending multiple chunks.
@@ -3008,16 +3047,16 @@ done:
 }
 
 // Request to create a durable consumer.
-func (s *Server) jsDurableCreateRequest(sub *subscription, c *client, subject, reply string, msg []byte) {
-	s.jsConsumerCreate(sub, c, subject, reply, msg, true)
+func (s *Server) jsDurableCreateRequest(sub *subscription, c *client, acc *Account, subject, reply string, msg []byte) {
+	s.jsConsumerCreate(sub, c, acc, subject, reply, msg, true)
 }
 
 // Request to create a consumer.
-func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, subject, reply string, msg []byte) {
-	s.jsConsumerCreate(sub, c, subject, reply, msg, false)
+func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, acc *Account, subject, reply string, msg []byte) {
+	s.jsConsumerCreate(sub, c, acc, subject, reply, msg, false)
 }
 
-func (s *Server) jsConsumerCreate(sub *subscription, c *client, subject, reply string, rmsg []byte, expectDurable bool) {
+func (s *Server) jsConsumerCreate(sub *subscription, c *client, a *Account, subject, reply string, rmsg []byte, expectDurable bool) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -3039,10 +3078,20 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, subject, reply s
 
 	var req CreateConsumerRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
-		resp.Error = ApiErrors[JSInvalidJSONErr]
+		resp.Error = NewJSInvalidJSONError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+
+	// We reject if flow control is set without heartbeats.
+	if req.Config.FlowControl && req.Config.Heartbeat == 0 {
+		resp.Error = NewJSConsumerWithFlowControlNeedsHeartbeatsError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	// Make sure we have sane defaults.
+	setConsumerConfigDefaults(&req.Config)
 
 	// Determine if we should proceed here when we are in clustered mode.
 	if s.JetStreamIsClustered() {
@@ -3057,7 +3106,7 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, subject, reply s
 				return
 			}
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				return
 			}
@@ -3070,43 +3119,43 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, subject, reply s
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if streamName != req.Stream {
-		resp.Error = ApiErrors[JSStreamMismatchErr]
+		resp.Error = NewJSStreamMismatchError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	if expectDurable {
 		if numTokens(subject) != 7 {
-			resp.Error = ApiErrors[JSConsumerDurableNameNotInSubjectErr]
+			resp.Error = NewJSConsumerDurableNameNotInSubjectError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		// Now check on requirements for durable request.
 		if req.Config.Durable == _EMPTY_ {
-			resp.Error = ApiErrors[JSConsumerDurableNameNotSetErr]
+			resp.Error = NewJSConsumerDurableNameNotSetError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		consumerName := tokenAt(subject, 7)
 		if consumerName != req.Config.Durable {
-			resp.Error = ApiErrors[JSConsumerDurableNameNotMatchSubjectErr]
+			resp.Error = NewJSConsumerDurableNameNotMatchSubjectError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 	} else {
 		if numTokens(subject) != 5 {
-			resp.Error = ApiErrors[JSConsumerEphemeralWithDurableInSubjectErr]
+			resp.Error = NewJSConsumerEphemeralWithDurableInSubjectError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		if req.Config.Durable != _EMPTY_ {
-			resp.Error = ApiErrors[JSConsumerEphemeralWithDurableNameErr]
+			resp.Error = NewJSConsumerEphemeralWithDurableNameError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3119,14 +3168,14 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, subject, reply s
 
 	stream, err := acc.lookupStream(req.Stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	o, err := stream.addConsumer(&req.Config)
 	if err != nil {
-		resp.Error = ApiErrors[JSConsumerCreateErrF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSConsumerCreateError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -3135,7 +3184,7 @@ func (s *Server) jsConsumerCreate(sub *subscription, c *client, subject, reply s
 }
 
 // Request for the list of all consumer names.
-func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -3157,7 +3206,7 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, r
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3169,7 +3218,7 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, r
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -3179,7 +3228,7 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, r
 	if !isEmptyRequest(msg) {
 		var req JSApiConsumersRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3199,14 +3248,14 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, r
 		sas := cc.streams[acc.Name]
 		if sas == nil {
 			js.mu.RUnlock()
-			resp.Error = ApiErrors[JSStreamNotFoundErr]
+			resp.Error = NewJSStreamNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		sa := sas[streamName]
 		if sa == nil || sa.err != nil {
 			js.mu.RUnlock()
-			resp.Error = ApiErrors[JSStreamNotFoundErr]
+			resp.Error = NewJSStreamNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3226,7 +3275,7 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, r
 	} else {
 		mset, err := acc.lookupStream(streamName)
 		if err != nil {
-			resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+			resp.Error = NewJSStreamNotFoundError(Unless(err))
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3255,7 +3304,7 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, subject, r
 }
 
 // Request for the list of all detailed consumer information.
-func (s *Server) jsConsumerListRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsConsumerListRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -3278,7 +3327,7 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, subject, re
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3290,7 +3339,7 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, subject, re
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
@@ -3300,7 +3349,7 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, subject, re
 	if !isEmptyRequest(msg) {
 		var req JSApiConsumersRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
-			resp.Error = ApiErrors[JSInvalidJSONErr]
+			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3320,7 +3369,7 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, subject, re
 
 	mset, err := acc.lookupStream(streamName)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -3348,7 +3397,7 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, subject, re
 }
 
 // Request for information about an consumer.
-func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -3363,6 +3412,12 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 
 	var resp = JSApiConsumerInfoResponse{ApiResponse: ApiResponse{Type: JSApiConsumerInfoResponseType}}
 
+	if !isEmptyRequest(msg) {
+		resp.Error = NewJSNotEmptyRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
 	// If we are in clustered mode we need to be the stream leader to proceed.
 	if s.JetStreamIsClustered() {
 		// Check to make sure the consumer is assigned.
@@ -3373,10 +3428,6 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 
 		js.mu.RLock()
 		isLeader, sa, ca := cc.isLeader(), js.streamAssignment(acc.Name, streamName), js.consumerAssignment(acc.Name, streamName, consumerName)
-		// Ignore pending consumers for now.
-		if ca != nil && ca.pending {
-			ca = nil
-		}
 		ourID := cc.meta.ID()
 		js.mu.RUnlock()
 
@@ -3384,23 +3435,23 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 			// We can't find the consumer, so mimic what would be the errors below.
 			if hasJS, doErr := acc.checkJetStream(); !hasJS {
 				if doErr {
-					resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+					resp.Error = NewJSNotEnabledForAccountError()
 					s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				}
 				return
 			}
 			if sa == nil {
-				resp.Error = ApiErrors[JSStreamNotFoundErr]
+				resp.Error = NewJSStreamNotFoundError()
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 				return
 			}
 			// If we are here the consumer is not present.
-			resp.Error = ApiErrors[JSConsumerNotFoundErr]
+			resp.Error = NewJSConsumerNotFoundError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		} else if ca == nil {
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				// Delaying an error response gives the leader a chance to respond before us
 				s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), nil)
 			}
@@ -3409,7 +3460,7 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 
 		// Check to see if we are a member of the group and if the group has no leader.
 		if js.isGroupLeaderless(ca.Group) {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3417,43 +3468,61 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 		// We have the consumer assigned and a leader, so only the consumer leader should answer.
 		if !acc.JetStreamIsConsumerLeader(streamName, consumerName) {
 			if js.isLeaderless() {
-				resp.Error = ApiErrors[JSClusterNotAvailErr]
+				resp.Error = NewJSClusterNotAvailError()
 				// Delaying an error response gives the leader a chance to respond before us
 				s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), ca.Group)
-			} else if ca != nil {
-				if rg := ca.Group; rg != nil && rg.node != nil && rg.isMember(ourID) {
-					// Check here if we are a member and this is just a new consumer that does not have a leader yet.
-					if rg.node.GroupLeader() == _EMPTY_ && !rg.node.HadPreviousLeader() {
-						resp.Error = ApiErrors[JSConsumerNotFoundErr]
-						s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), nil)
-					}
-				}
+				return
 			}
-			return
+			if ca == nil {
+				return
+			}
+			// We have a consumer assignment.
+			js.mu.RLock()
+			var node RaftNode
+			if rg := ca.Group; rg != nil && rg.node != nil && rg.isMember(ourID) {
+				node = rg.node
+			}
+			js.mu.RUnlock()
+			// Check if we should ignore all together.
+			if node == nil {
+				// We have been assigned and are pending.
+				if ca.pending {
+					// Send our config and defaults for state and no cluster info.
+					resp.ConsumerInfo = &ConsumerInfo{
+						Stream:  ca.Stream,
+						Name:    ca.Name,
+						Created: ca.Created,
+						Config:  ca.Config,
+					}
+					s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
+				}
+				return
+			}
+			if node != nil && (node.GroupLeader() != _EMPTY_ || node.HadPreviousLeader()) {
+				return
+			}
+			// If we are here we are a member and this is just a new consumer that does not have a leader yet.
+			// Will fall through and return what we have. All consumers can respond but this should be very rare
+			// but makes more sense to clients when they try to create, get a consumer exists, and then do consumer info.
 		}
 	}
 
 	if !acc.JetStreamEnabled() {
-		resp.Error = ApiErrors[JSNotEnabledForAccountErr]
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-		return
-	}
-	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSNotEmptyRequestErr]
+		resp.Error = NewJSNotEnabledForAccountError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	mset, err := acc.lookupStream(streamName)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	obs := mset.lookupConsumer(consumerName)
 	if obs == nil {
-		resp.Error = ApiErrors[JSConsumerNotFoundErr]
+		resp.Error = NewJSConsumerNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -3462,7 +3531,7 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 }
 
 // Request to delete an Consumer.
-func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -3481,7 +3550,7 @@ func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, subject, 
 			return
 		}
 		if js.isLeaderless() {
-			resp.Error = ApiErrors[JSClusterNotAvailErr]
+			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
@@ -3493,13 +3562,13 @@ func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, subject, 
 
 	if hasJS, doErr := acc.checkJetStream(); !hasJS {
 		if doErr {
-			resp.Error = ApiErrors[JSNotEnabledForAccountErr]
+			resp.Error = NewJSNotEnabledForAccountError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		}
 		return
 	}
 	if !isEmptyRequest(msg) {
-		resp.Error = ApiErrors[JSNotEmptyRequestErr]
+		resp.Error = NewJSNotEmptyRequestError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -3513,19 +3582,19 @@ func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, subject, 
 
 	mset, err := acc.lookupStream(stream)
 	if err != nil {
-		resp.Error = ApiErrors[JSStreamNotFoundErr].ErrOr(err)
+		resp.Error = NewJSStreamNotFoundError(Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
 	obs := mset.lookupConsumer(consumer)
 	if obs == nil {
-		resp.Error = ApiErrors[JSConsumerNotFoundErr]
+		resp.Error = NewJSConsumerNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 	if err := obs.delete(); err != nil {
-		resp.Error = ApiErrors[JSStreamGeneralErrorF].ErrOrNewT(err, "{err}", err)
+		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}

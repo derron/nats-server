@@ -2578,16 +2578,26 @@ func TestLargeMaxControlLine(t *testing.T) {
 }
 
 func TestLargeMaxPayload(t *testing.T) {
-	confFileName := "big_mp.conf"
+	confFileName := createConfFile(t, []byte(`
+		max_payload = 3000000000
+	`))
 	defer removeFile(t, confFileName)
-	content := `
-    max_payload = 3000000000
-    `
-	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
-		t.Fatalf("Error writing config file: %v", err)
-	}
 	if _, err := ProcessConfigFile(confFileName); err == nil {
 		t.Fatalf("Expected an error from too large of a max_payload entry")
+	}
+
+	confFileName = createConfFile(t, []byte(`
+		max_payload = 100000
+		max_pending = 50000
+	`))
+	defer removeFile(t, confFileName)
+	o := LoadConfig(confFileName)
+	s, err := NewServer(o)
+	if err == nil || !strings.Contains(err.Error(), "cannot be higher") {
+		if s != nil {
+			s.Shutdown()
+		}
+		t.Fatalf("Unexpected error: %v", err)
 	}
 }
 
@@ -3189,4 +3199,27 @@ func TestQueuePermissions(t *testing.T) {
 		})
 
 	}
+}
+
+func TestResolverPinnedAccountsFail(t *testing.T) {
+	cfgFmt := `
+		operator: %s
+		resolver: URL(foo.bar)
+		resolver_pinned_accounts: [%s]
+	`
+	dirSrv := createDir(t, "srv")
+	defer removeDir(t, dirSrv)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(cfgFmt, ojwt, "f")))
+	defer removeFile(t, conf)
+	srv, err := NewServer(LoadConfig(conf))
+	defer srv.Shutdown()
+	require_Error(t, err)
+	require_Contains(t, err.Error(), " is not a valid public account nkey")
+
+	conf = createConfFile(t, []byte(fmt.Sprintf(cfgFmt, ojwt, "1, x")))
+	defer removeFile(t, conf)
+	_, err = ProcessConfigFile(conf)
+	require_Error(t, err)
+	require_Contains(t, "parsing resolver_pinned_accounts: unsupported type")
 }

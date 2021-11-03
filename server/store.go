@@ -79,7 +79,8 @@ type StreamStore interface {
 	Compact(seq uint64) (uint64, error)
 	Truncate(seq uint64) error
 	GetSeqFromTime(t time.Time) uint64
-	FilteredState(sseq uint64, subject string) SimpleState
+	FilteredState(seq uint64, subject string) SimpleState
+	SubjectsState(filterSubject string) map[string]SimpleState
 	State() StreamState
 	FastState(*StreamState)
 	Type() StorageType
@@ -89,6 +90,7 @@ type StreamStore interface {
 	Stop() error
 	ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerStore, error)
 	Snapshot(deadline time.Duration, includeConsumers, checkMsgs bool) (*SnapshotResult, error)
+	Utilization() (total, reported uint64, err error)
 }
 
 // RetentionPolicy determines how messages in a set are retained.
@@ -111,7 +113,7 @@ type DiscardPolicy int
 const (
 	// DiscardOld will remove older messages to return to the limits.
 	DiscardOld = iota
-	//DiscardNew will error on a StoreMsg call
+	// DiscardNew will error on a StoreMsg call
 	DiscardNew
 )
 
@@ -154,6 +156,7 @@ type ConsumerStore interface {
 	UpdateAcks(dseq, sseq uint64) error
 	Update(*ConsumerState) error
 	State() (*ConsumerState, error)
+	Type() StorageType
 	Stop() error
 	Delete() error
 	StreamDelete() error
@@ -389,6 +392,7 @@ const (
 	deliverNewPolicyString       = "new"
 	deliverByStartSequenceString = "by_start_sequence"
 	deliverByStartTimeString     = "by_start_time"
+	deliverLastPerPolicyString   = "last_per_subject"
 	deliverUndefinedString       = "undefined"
 )
 
@@ -398,6 +402,8 @@ func (p *DeliverPolicy) UnmarshalJSON(data []byte) error {
 		*p = DeliverAll
 	case jsonString(deliverLastPolicyString):
 		*p = DeliverLast
+	case jsonString(deliverLastPerPolicyString):
+		*p = DeliverLastPerSubject
 	case jsonString(deliverNewPolicyString):
 		*p = DeliverNew
 	case jsonString(deliverByStartSequenceString):
@@ -417,6 +423,8 @@ func (p DeliverPolicy) MarshalJSON() ([]byte, error) {
 		return json.Marshal(deliverAllPolicyString)
 	case DeliverLast:
 		return json.Marshal(deliverLastPolicyString)
+	case DeliverLastPerSubject:
+		return json.Marshal(deliverLastPerPolicyString)
 	case DeliverNew:
 		return json.Marshal(deliverNewPolicyString)
 	case DeliverByStartSequence:
@@ -430,4 +438,11 @@ func (p DeliverPolicy) MarshalJSON() ([]byte, error) {
 
 func isOutOfSpaceErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no space left")
+}
+
+// For when our upper layer catchup detects its missing messages from the beginning of the stream.
+var errFirstSequenceMismatch = errors.New("first sequence mismatch")
+
+func isClusterResetErr(err error) bool {
+	return err == errLastSeqMismatch || err == ErrStoreEOF || err == errFirstSequenceMismatch
 }

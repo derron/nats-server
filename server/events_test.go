@@ -178,6 +178,9 @@ func TestSystemAccount(t *testing.T) {
 	if s.sys.client == nil {
 		t.Fatalf("Expected sys.client to be non-nil")
 	}
+
+	s.sys.client.mu.Lock()
+	defer s.sys.client.mu.Unlock()
 	if s.sys.client.echo {
 		t.Fatalf("Internal clients should always have echo false")
 	}
@@ -635,7 +638,7 @@ func TestSysSubscribeRace(t *testing.T) {
 
 	received := make(chan struct{})
 	// Create message callback handler.
-	cb := func(sub *subscription, producer *client, subject, reply string, msg []byte) {
+	cb := func(sub *subscription, producer *client, _ *Account, subject, reply string, msg []byte) {
 		select {
 		case received <- struct{}{}:
 		default:
@@ -682,7 +685,7 @@ func TestSystemAccountInternalSubscriptions(t *testing.T) {
 
 	received := make(chan *nats.Msg)
 	// Create message callback handler.
-	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
+	cb := func(sub *subscription, _ *client, _ *Account, subject, reply string, msg []byte) {
 		copy := append([]byte(nil), msg...)
 		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copy}
 	}
@@ -756,11 +759,11 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 
 	// Listen for updates to the new account connection activity.
 	received := make(chan *nats.Msg, 10)
-	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
+	cb := func(sub *subscription, _ *client, _ *Account, subject, reply string, msg []byte) {
 		copy := append([]byte(nil), msg...)
 		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copy}
 	}
-	subj := fmt.Sprintf(accConnsEventSubjOld, pub)
+	subj := fmt.Sprintf(accConnsEventSubjNew, pub)
 	sub, err := sa.sysSubscribe(subj, cb)
 	if sub == nil || err != nil {
 		t.Fatalf("Expected to subscribe, got %v", err)
@@ -1256,8 +1259,8 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":1,`) {
-		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
+	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":3,`) {
+		t.Fatalf("unexpected subs count (expected 3): %v", string(resp.Data))
 	}
 	// create a subscription
 	if sub, err := nc.Subscribe("foo", func(msg *nats.Msg) {}); err != nil {
@@ -1269,8 +1272,8 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query SUBSZ for account
 	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
 		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":2,`) {
-		t.Fatalf("unexpected subs count (expected 2): %v", string(resp.Data))
+	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":4,`) {
+		t.Fatalf("unexpected subs count (expected 4): %v", string(resp.Data))
 	} else if !strings.Contains(string(resp.Data), `"subject":"foo"`) {
 		t.Fatalf("expected subscription foo: %v", string(resp.Data))
 	}
@@ -1279,7 +1282,7 @@ func TestAccountReqMonitoring(t *testing.T) {
 		t.Fatalf("Error on request: %v", err)
 	} else if !strings.Contains(string(resp.Data), `"num_connections":1,`) {
 		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
-	} else if !strings.Contains(string(resp.Data), `"total":2,`) { // includes system acc connection
+	} else if !strings.Contains(string(resp.Data), `"total":1,`) {
 		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
 	}
 	// query connections for js account
@@ -1362,15 +1365,15 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unmarshalling failed: %v", err)
 	} else if len(info.Exports) != 1 {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if len(info.Imports) != 0 {
-		t.Fatalf("Unexpected value: %v", info.Imports)
+	} else if len(info.Imports) != 2 {
+		t.Fatalf("Unexpected value: %+v", info.Imports)
 	} else if info.Exports[0].Subject != "req.*" {
 		t.Fatalf("Unexpected value: %v", info.Exports)
 	} else if info.Exports[0].Type != jwt.Service {
 		t.Fatalf("Unexpected value: %v", info.Exports)
 	} else if info.Exports[0].ResponseType != jwt.ResponseTypeSingleton {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if info.SubCnt != 0 {
+	} else if info.SubCnt != 2 {
 		t.Fatalf("Unexpected value: %v", info.SubCnt)
 	} else {
 		checkCommon(&info, &srv, pub1, ajwt1)
@@ -1383,16 +1386,26 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unmarshalling failed: %v", err)
 	} else if len(info.Exports) != 0 {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if len(info.Imports) != 1 {
-		t.Fatalf("Unexpected value: %v", info.Imports)
-	} else if info.Imports[0].Subject != "req.1" {
-		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if info.Imports[0].Type != jwt.Service {
-		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if info.Imports[0].Account != pub1 {
-		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if info.SubCnt != 1 {
-		t.Fatalf("Unexpected value: %v", info.SubCnt)
+	} else if len(info.Imports) != 3 {
+		t.Fatalf("Unexpected value: %+v", info.Imports)
+	}
+	// Here we need to find our import
+	var si *ExtImport
+	for _, im := range info.Imports {
+		if im.Subject == "req.1" {
+			si = &im
+			break
+		}
+	}
+	if si == nil {
+		t.Fatalf("Could not find our import")
+	}
+	if si.Type != jwt.Service {
+		t.Fatalf("Unexpected value: %+v", si)
+	} else if si.Account != pub1 {
+		t.Fatalf("Unexpected value: %+v", si)
+	} else if info.SubCnt != 3 {
+		t.Fatalf("Unexpected value: %+v", si)
 	} else {
 		checkCommon(&info, &srv, pub2, ajwt2)
 	}
@@ -1449,7 +1462,7 @@ func TestAccountClaimsUpdatesWithServiceImports(t *testing.T) {
 	}
 	nc.Flush()
 
-	if startSubs != s.NumSubscriptions() {
+	if startSubs < s.NumSubscriptions() {
 		t.Fatalf("Subscriptions leaked: %d vs %d", startSubs, s.NumSubscriptions())
 	}
 }
@@ -1574,7 +1587,7 @@ func TestSystemAccountWithBadRemoteLatencyUpdate(t *testing.T) {
 		ReqId:   "_INBOX.22",
 	}
 	b, _ := json.Marshal(&rl)
-	s.remoteLatencyUpdate(nil, nil, "foo", "", b)
+	s.remoteLatencyUpdate(nil, nil, nil, "foo", _EMPTY_, b)
 }
 
 func TestSystemAccountWithGateways(t *testing.T) {
@@ -1594,7 +1607,7 @@ func TestSystemAccountWithGateways(t *testing.T) {
 
 	// If this tests fails with wrong number after 10 seconds we may have
 	// added a new inititial subscription for the eventing system.
-	checkExpectedSubs(t, 37, sa)
+	checkExpectedSubs(t, 40, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -2132,10 +2145,10 @@ func TestConnectionUpdatesTimerProperlySet(t *testing.T) {
 
 	// Listen for HB updates...
 	count := int32(0)
-	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
+	cb := func(sub *subscription, _ *client, _ *Account, subject, reply string, msg []byte) {
 		atomic.AddInt32(&count, 1)
 	}
-	subj := fmt.Sprintf(accConnsEventSubjOld, pub)
+	subj := fmt.Sprintf(accConnsEventSubjNew, pub)
 	sub, err := sa.sysSubscribe(subj, cb)
 	if sub == nil || err != nil {
 		t.Fatalf("Expected to subscribe, got %v", err)

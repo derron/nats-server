@@ -270,10 +270,9 @@ func (ms *memStore) filteredStateLocked(sseq uint64, subj string) SimpleState {
 		return ss
 	}
 
-	// If we want everything.
-	if subj == _EMPTY_ || subj == fwcs {
-		ss.Msgs, ss.First, ss.Last = ms.state.Msgs, ms.state.FirstSeq, ms.state.LastSeq
-		return ss
+	// Empty same as everything.
+	if subj == _EMPTY_ {
+		subj = fwcs
 	}
 
 	wc := subjectHasWildcard(subj)
@@ -315,6 +314,31 @@ func (ms *memStore) filteredStateLocked(sseq uint64, subj string) SimpleState {
 		}
 	}
 	return ss
+}
+
+// SubjectsState returns a map of SimpleState for all matching subjects.
+func (ms *memStore) SubjectsState(subject string) map[string]SimpleState {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+
+	if len(ms.fss) == 0 {
+		return nil
+	}
+
+	fss := make(map[string]SimpleState)
+	for subj, ss := range ms.fss {
+		if subject == _EMPTY_ || subject == fwcs || subjectIsSubsetMatch(subj, subject) {
+			oss := fss[subj]
+			if oss.First == 0 { // New
+				fss[subj] = *ss
+			} else {
+				// Merge here.
+				oss.Last, oss.Msgs = ss.Last, oss.Msgs+ss.Msgs
+				fss[subj] = oss
+			}
+		}
+	}
+	return fss
 }
 
 // Will check the msg limit for this tracked subject.
@@ -741,6 +765,12 @@ func (ms *memStore) State() StreamState {
 	return state
 }
 
+func (ms *memStore) Utilization() (total, reported uint64, err error) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.state.Bytes, ms.state.Bytes, nil
+}
+
 func memStoreMsgSize(subj string, hdr, msg []byte) uint64 {
 	return uint64(len(subj) + len(hdr) + len(msg) + 16) // 8*2 for seq + age
 }
@@ -809,6 +839,9 @@ func (os *consumerMemStore) StreamDelete() error {
 }
 
 func (os *consumerMemStore) State() (*ConsumerState, error) { return nil, nil }
+
+// Type returns the type of the underlying store.
+func (os *consumerMemStore) Type() StorageType { return MemoryStorage }
 
 // Templates
 type templateMemStore struct{}

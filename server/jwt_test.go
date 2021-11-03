@@ -1556,7 +1556,18 @@ func TestAccountURLResolver(t *testing.T) {
 			})
 			var ts *httptest.Server
 			if test.useTLS {
-				ts = httptest.NewTLSServer(hf)
+				tc := &TLSConfigOpts{
+					CertFile: "../test/configs/certs/server-cert.pem",
+					KeyFile:  "../test/configs/certs/server-key.pem",
+					CaFile:   "../test/configs/certs/ca.pem",
+				}
+				tlsConfig, err := GenTLSConfig(tc)
+				if err != nil {
+					t.Fatalf("Error generating tls config: %v", err)
+				}
+				ts = httptest.NewUnstartedServer(hf)
+				ts.TLS = tlsConfig
+				ts.StartTLS()
 			} else {
 				ts = httptest.NewServer(hf)
 			}
@@ -1567,7 +1578,9 @@ func TestAccountURLResolver(t *testing.T) {
 				listen: -1
 				resolver: URL("%s/ngs/v1/accounts/jwt/")
 				resolver_tls {
-					insecure: true
+					cert_file: "../test/configs/certs/client-cert.pem"
+					key_file: "../test/configs/certs/client-key.pem"
+					ca_file: "../test/configs/certs/ca.pem"
 				}
 			`
 			conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, ojwt, ts.URL)))
@@ -3864,7 +3877,7 @@ func newTimeRange(start time.Time, dur time.Duration) jwt.TimeRange {
 	return jwt.TimeRange{Start: start.Format("15:04:05"), End: start.Add(dur).Format("15:04:05")}
 }
 
-func createUserWithLimit(t *testing.T, accKp nkeys.KeyPair, expiration time.Time, limits func(*jwt.Limits)) string {
+func createUserWithLimit(t *testing.T, accKp nkeys.KeyPair, expiration time.Time, limits func(*jwt.UserPermissionLimits)) string {
 	t.Helper()
 	ukp, _ := nkeys.CreateUser()
 	seed, _ := ukp.Seed()
@@ -3872,7 +3885,7 @@ func createUserWithLimit(t *testing.T, accKp nkeys.KeyPair, expiration time.Time
 	uclaim := newJWTTestUserClaims()
 	uclaim.Subject = upub
 	if limits != nil {
-		limits(&uclaim.Limits)
+		limits(&uclaim.UserPermissionLimits)
 	}
 	if !expiration.IsZero() {
 		uclaim.Expires = expiration.Unix()
@@ -3909,31 +3922,33 @@ func TestJWTUserLimits(t *testing.T) {
 	defer sA.Shutdown()
 	for _, v := range []struct {
 		pass bool
-		f    func(*jwt.Limits)
+		f    func(*jwt.UserPermissionLimits)
 	}{
 		{true, nil},
-		{false, func(j *jwt.Limits) { j.Src.Set("8.8.8.8/8") }},
-		{true, func(j *jwt.Limits) { j.Src.Set("8.8.8.8/0") }},
-		{true, func(j *jwt.Limits) { j.Src.Set("127.0.0.1/8") }},
-		{true, func(j *jwt.Limits) { j.Src.Set("8.8.8.8/8,127.0.0.1/8") }},
-		{false, func(j *jwt.Limits) { j.Src.Set("8.8.8.8/8,9.9.9.9/8") }},
-		{true, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now(), time.Hour)) }},
-		{false, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now().Add(time.Hour), time.Hour)) }},
-		{true, func(j *jwt.Limits) {
+		{false, func(j *jwt.UserPermissionLimits) { j.Src.Set("8.8.8.8/8") }},
+		{true, func(j *jwt.UserPermissionLimits) { j.Src.Set("8.8.8.8/0") }},
+		{true, func(j *jwt.UserPermissionLimits) { j.Src.Set("127.0.0.1/8") }},
+		{true, func(j *jwt.UserPermissionLimits) { j.Src.Set("8.8.8.8/8,127.0.0.1/8") }},
+		{false, func(j *jwt.UserPermissionLimits) { j.Src.Set("8.8.8.8/8,9.9.9.9/8") }},
+		{true, func(j *jwt.UserPermissionLimits) { j.Times = append(j.Times, newTimeRange(time.Now(), time.Hour)) }},
+		{false, func(j *jwt.UserPermissionLimits) {
+			j.Times = append(j.Times, newTimeRange(time.Now().Add(time.Hour), time.Hour))
+		}},
+		{true, func(j *jwt.UserPermissionLimits) {
 			j.Times = append(j.Times, newTimeRange(inAnHour, time.Hour), newTimeRange(time.Now(), time.Hour))
 		}}, // last one is within range
-		{false, func(j *jwt.Limits) {
+		{false, func(j *jwt.UserPermissionLimits) {
 			j.Times = append(j.Times, newTimeRange(inAnHour, time.Hour), newTimeRange(inTwoHours, time.Hour))
 		}}, // out of range
-		{false, func(j *jwt.Limits) {
+		{false, func(j *jwt.UserPermissionLimits) {
 			j.Times = append(j.Times, newTimeRange(inAnHour, 3*time.Hour), newTimeRange(inTwoHours, 2*time.Hour))
 		}}, // overlapping [a[]b] out of range*/
-		{false, func(j *jwt.Limits) {
+		{false, func(j *jwt.UserPermissionLimits) {
 			j.Times = append(j.Times, newTimeRange(inAnHour, 3*time.Hour), newTimeRange(inTwoHours, time.Hour))
 		}}, // overlapping [a[b]] out of range
 		// next day tests where end < begin
-		{true, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now(), 25*time.Hour)) }},
-		{true, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now(), -time.Hour)) }},
+		{true, func(j *jwt.UserPermissionLimits) { j.Times = append(j.Times, newTimeRange(time.Now(), 25*time.Hour)) }},
+		{true, func(j *jwt.UserPermissionLimits) { j.Times = append(j.Times, newTimeRange(time.Now(), -time.Hour)) }},
 	} {
 		t.Run("", func(t *testing.T) {
 			creds := createUserWithLimit(t, kp, doNotExpire, v.f)
@@ -3976,7 +3991,7 @@ func TestJWTTimeExpiration(t *testing.T) {
 	for _, l := range []string{"", "Europe/Berlin", "America/New_York"} {
 		t.Run("simple expiration "+l, func(t *testing.T) {
 			start := time.Now()
-			creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.Limits) {
+			creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.UserPermissionLimits) {
 				if l == "" {
 					j.Times = []jwt.TimeRange{newTimeRange(start, validFor)}
 				} else {
@@ -4020,7 +4035,7 @@ func TestJWTTimeExpiration(t *testing.T) {
 	t.Run("double expiration", func(t *testing.T) {
 		start1 := time.Now()
 		start2 := start1.Add(2 * validFor)
-		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.Limits) {
+		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.UserPermissionLimits) {
 			j.Times = []jwt.TimeRange{newTimeRange(start1, validFor), newTimeRange(start2, validFor)}
 		})
 		defer removeFile(t, creds)
@@ -4059,7 +4074,7 @@ func TestJWTTimeExpiration(t *testing.T) {
 	})
 	t.Run("lower jwt expiration overwrites time", func(t *testing.T) {
 		start := time.Now()
-		creds := createUserWithLimit(t, kp, start.Add(validFor), func(j *jwt.Limits) { j.Times = []jwt.TimeRange{newTimeRange(start, 2*validFor)} })
+		creds := createUserWithLimit(t, kp, start.Add(validFor), func(j *jwt.UserPermissionLimits) { j.Times = []jwt.TimeRange{newTimeRange(start, 2*validFor)} })
 		defer removeFile(t, creds)
 		disconnectChan := make(chan struct{})
 		defer close(disconnectChan)
@@ -4114,7 +4129,7 @@ func TestJWTLimits(t *testing.T) {
 	errChan := make(chan struct{})
 	defer close(errChan)
 	t.Run("subs", func(t *testing.T) {
-		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.Limits) { j.Subs = 1 })
+		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.UserPermissionLimits) { j.Subs = 1 })
 		defer removeFile(t, creds)
 		c := natsConnect(t, sA.ClientURL(), nats.UserCredentials(creds),
 			nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
@@ -4133,7 +4148,7 @@ func TestJWTLimits(t *testing.T) {
 		chanRecv(t, errChan, time.Second)
 	})
 	t.Run("payload", func(t *testing.T) {
-		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.Limits) { j.Payload = 5 })
+		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.UserPermissionLimits) { j.Payload = 5 })
 		defer removeFile(t, creds)
 		c := natsConnect(t, sA.ClientURL(), nats.UserCredentials(creds))
 		defer c.Close()
@@ -5740,6 +5755,70 @@ func TestJWTMappings(t *testing.T) {
 	test("foo2", "bar2", true)
 }
 
+func TestJWTOperatorPinnedAccounts(t *testing.T) {
+	kps, pubs, jwts := [4]nkeys.KeyPair{}, [4]string{}, [4]string{}
+	for i := 0; i < 4; i++ {
+		kps[i], pubs[i] = createKey(t)
+		jwts[i] = encodeClaim(t, jwt.NewAccountClaims(pubs[i]), pubs[i])
+	}
+	sysCreds := newUser(t, kps[0]) // index 0 is handled as system account
+	defer removeFile(t, sysCreds)
+
+	dirSrv := createDir(t, "srv")
+	defer removeDir(t, dirSrv)
+
+	cfgCommon := fmt.Sprintf(`
+		listen: -1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s:%s
+			%s:%s
+			%s:%s
+			%s:%s
+		}`, ojwt, pubs[0], pubs[0], jwts[0], pubs[1], jwts[1], pubs[2], jwts[2], pubs[3], jwts[3])
+	cfgFmt := cfgCommon + `
+		resolver_pinned_accounts: [%s, %s]
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(cfgFmt, pubs[1], pubs[2])))
+	defer removeFile(t, conf)
+	srv, _ := RunServerWithConfig(conf)
+	defer srv.Shutdown()
+
+	connectPass := func(keys ...nkeys.KeyPair) {
+		for _, kp := range keys {
+			nc, err := nats.Connect(srv.ClientURL(), createUserCreds(t, srv, kp))
+			require_NoError(t, err)
+			defer nc.Close()
+		}
+	}
+	var pinnedFail uint64
+	connectFail := func(key nkeys.KeyPair) {
+		_, err := nats.Connect(srv.ClientURL(), createUserCreds(t, srv, key))
+		require_Error(t, err)
+		require_Contains(t, err.Error(), "Authorization Violation")
+		v, err := srv.Varz(&VarzOptions{})
+		require_NoError(t, err)
+		require_True(t, pinnedFail+1 == v.PinnedAccountFail)
+		pinnedFail = v.PinnedAccountFail
+	}
+
+	connectPass(kps[0], kps[1], kps[2]) // make sure user from accounts listed and system account (index 0) work
+	connectFail(kps[3])                 // make sure the other user does not work
+	// reload and test again
+	reloadUpdateConfig(t, srv, conf, fmt.Sprintf(cfgFmt, pubs[2], pubs[3]))
+	connectPass(kps[0], kps[2], kps[3]) // make sure user from accounts listed and system account (index 0) work
+	connectFail(kps[1])                 // make sure the other user does not work
+	// completely disable and test again
+	reloadUpdateConfig(t, srv, conf, cfgCommon)
+	connectPass(kps[0], kps[1], kps[2], kps[3]) // make sure every account and system account (index 0) can connect
+	// re-enable and test again
+	reloadUpdateConfig(t, srv, conf, fmt.Sprintf(cfgFmt, pubs[2], pubs[3]))
+	connectPass(kps[0], kps[2], kps[3]) // make sure user from accounts listed and system account (index 0) work
+	connectFail(kps[1])                 // make sure the other user does not work
+}
+
 func TestJWTNoSystemAccountButNatsResolver(t *testing.T) {
 	dirSrv := createDir(t, "srv")
 	defer removeDir(t, dirSrv)
@@ -5763,4 +5842,92 @@ func TestJWTNoSystemAccountButNatsResolver(t *testing.T) {
 			require_Contains(t, err.Error(), "the system account needs to be specified in configuration or the operator jwt")
 		})
 	}
+}
+
+func TestJWTAccountConnzAccessAfterClaimUpdate(t *testing.T) {
+	skp, spub := createKey(t)
+	screds := newUser(t, skp)
+	defer removeFile(t, screds)
+
+	sclaim := jwt.NewAccountClaims(spub)
+	sclaim.AddMapping("foo.bar", jwt.WeightedMapping{Subject: "foo.baz"})
+	sjwt := encodeClaim(t, sclaim, spub)
+
+	// create two jwt, one with and one without mapping
+	akp, apub := createKey(t)
+	creds := newUser(t, akp)
+	defer removeFile(t, creds)
+	claim := jwt.NewAccountClaims(apub)
+	jwt1 := encodeClaim(t, claim, apub)
+	claim.AddMapping("foo.bar", jwt.WeightedMapping{Subject: "foo.baz"})
+	jwt2 := encodeClaim(t, claim, apub)
+
+	dirSrv := createDir(t, "srv")
+	defer removeDir(t, dirSrv)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: -1
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: %s
+		}
+    `, ojwt, spub, dirSrv)))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	type zapi struct {
+		Server *ServerInfo
+		Data   *Connz
+		Error  *ApiError
+	}
+
+	updateJWT := func(jwt string) {
+		t.Helper()
+		sc := natsConnect(t, s.ClientURL(), createUserCreds(t, s, skp))
+		defer sc.Close()
+		resp, err := sc.Request("$SYS.REQ.CLAIMS.UPDATE", []byte(jwt), time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var cz zapi
+		if err := json.Unmarshal(resp.Data, &cz); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if cz.Error != nil {
+			t.Fatalf("Unexpected error: %+v", cz.Error)
+		}
+	}
+
+	updateJWT(jwt1)
+
+	nc := natsConnect(t, s.ClientURL(), createUserCreds(t, s, akp))
+	defer nc.Close()
+
+	doRequest := func() {
+		t.Helper()
+		resp, err := nc.Request("$SYS.REQ.SERVER.PING.CONNZ", nil, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var cz zapi
+		if err := json.Unmarshal(resp.Data, &cz); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if cz.Error != nil {
+			t.Fatalf("Unexpected error: %+v", cz.Error)
+		}
+	}
+
+	doRequest()
+	updateJWT(jwt2)
+	// If we accidentally wipe the system import this will fail with no responders.
+	doRequest()
+	// Now test updating system account.
+	updateJWT(sjwt)
+	// If export was wiped this would fail with timeout.
+	doRequest()
 }

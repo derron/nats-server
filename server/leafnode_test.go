@@ -32,6 +32,8 @@ import (
 
 	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
+
+	"github.com/nats-io/nats-server/v2/internal/testhelper"
 )
 
 type captureLeafNodeRandomIPLogger struct {
@@ -329,7 +331,7 @@ func TestLeafNodeTLSRemoteWithNoCerts(t *testing.T) {
 		t.Fatal("Expected at least a single leaf remote")
 	}
 	got = o4.LeafNode.Remotes[0].TLSTimeout
-	expected = float64(DEFAULT_LEAF_TLS_TIMEOUT)
+	expected = float64(DEFAULT_LEAF_TLS_TIMEOUT) / float64(time.Second)
 	if int(got) != int(expected) {
 		t.Fatalf("Expected %v, got: %v", expected, got)
 	}
@@ -409,7 +411,12 @@ func TestLeafNodeAccountNotFound(t *testing.T) {
 
 // This test ensures that we can connect using proper user/password
 // to a LN URL that was discovered through the INFO protocol.
+// We also check that the password doesn't leak to debug/trace logs.
 func TestLeafNodeBasicAuthFailover(t *testing.T) {
+	// Something a little longer than "pwd" to prevent false positives amongst many log lines;
+	// don't make it complex enough to be subject to %-escaping, we want a simple needle search.
+	fatalPassword := "pwdfatal"
+
 	content := `
 	listen: "127.0.0.1:-1"
 	cluster {
@@ -421,18 +428,18 @@ func TestLeafNodeBasicAuthFailover(t *testing.T) {
 		listen: "127.0.0.1:-1"
 		authorization {
 			user: foo
-			password: pwd
+			password: %s
 			timeout: 1
 		}
 	}
 	`
-	conf := createConfFile(t, []byte(fmt.Sprintf(content, "")))
+	conf := createConfFile(t, []byte(fmt.Sprintf(content, "", fatalPassword)))
 	defer removeFile(t, conf)
 
 	sb1, ob1 := RunServerWithConfig(conf)
 	defer sb1.Shutdown()
 
-	conf = createConfFile(t, []byte(fmt.Sprintf(content, fmt.Sprintf("routes: [nats://127.0.0.1:%d]", ob1.Cluster.Port))))
+	conf = createConfFile(t, []byte(fmt.Sprintf(content, fmt.Sprintf("routes: [nats://127.0.0.1:%d]", ob1.Cluster.Port), fatalPassword)))
 	defer removeFile(t, conf)
 
 	sb2, _ := RunServerWithConfig(conf)
@@ -450,16 +457,19 @@ func TestLeafNodeBasicAuthFailover(t *testing.T) {
 		remotes [
 			{
 				account: "foo"
-				url: "nats://foo:pwd@127.0.0.1:%d"
+				url: "nats://foo:%s@127.0.0.1:%d"
 			}
 		]
 	}
 	`
-	conf = createConfFile(t, []byte(fmt.Sprintf(content, ob1.LeafNode.Port)))
+	conf = createConfFile(t, []byte(fmt.Sprintf(content, fatalPassword, ob1.LeafNode.Port)))
 	defer removeFile(t, conf)
 
 	sa, _ := RunServerWithConfig(conf)
 	defer sa.Shutdown()
+
+	l := testhelper.NewDummyLogger(100)
+	sa.SetLogger(l, true, true) // we want debug & trace logs, to check for passwords in them
 
 	checkLeafNodeConnected(t, sa)
 
@@ -471,6 +481,10 @@ func TestLeafNodeBasicAuthFailover(t *testing.T) {
 
 	// Should be able to reconnect
 	checkLeafNodeConnected(t, sa)
+
+	// Look at all our logs for the password; at time of writing it doesn't appear
+	// but we want to safe-guard against it.
+	l.CheckForProhibited(t, "fatal password", fatalPassword)
 }
 
 func TestLeafNodeRTT(t *testing.T) {
@@ -1285,8 +1299,8 @@ func TestLeafNodePermissions(t *testing.T) {
 
 	// Create a sub on ">" on LN1
 	subAll := natsSubSync(t, nc1, ">")
-	// this should be registered in LN2 (there is 1 sub for LN1 $LDS subject)
-	checkSubs(ln2.globalAccount(), 2)
+	// this should be registered in LN2 (there is 1 sub for LN1 $LDS subject) + SYS IMPORTS
+	checkSubs(ln2.globalAccount(), 8)
 
 	// Check deny export clause from messages published from LN2
 	for _, test := range []struct {
@@ -1312,8 +1326,8 @@ func TestLeafNodePermissions(t *testing.T) {
 	}
 
 	subAll.Unsubscribe()
-	// Goes down to 1 (the $LDS one)
-	checkSubs(ln2.globalAccount(), 1)
+	// Goes down by 1.
+	checkSubs(ln2.globalAccount(), 7)
 
 	// We used to make sure we would not do subscriptions however that
 	// was incorrect. We need to check publishes, not the subscriptions.
@@ -1338,7 +1352,7 @@ func TestLeafNodePermissions(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			sub := natsSubSync(t, nc2, test.subSubject)
-			checkSubs(ln2.globalAccount(), 2)
+			checkSubs(ln2.globalAccount(), 8)
 
 			if !test.ok {
 				nc1.Publish(test.pubSubject, []byte("msg"))
@@ -1346,13 +1360,12 @@ func TestLeafNodePermissions(t *testing.T) {
 					t.Fatalf("Did not expect to get the message")
 				}
 			} else {
-				checkSubs(ln1.globalAccount(), 2)
+				checkSubs(ln1.globalAccount(), 7)
 				nc1.Publish(test.pubSubject, []byte("msg"))
 				natsNexMsg(t, sub, time.Second)
 			}
 			sub.Unsubscribe()
-			checkSubs(ln1.globalAccount(), 1)
-
+			checkSubs(ln1.globalAccount(), 6)
 		})
 	}
 }
@@ -1472,8 +1485,8 @@ func TestLeafNodeExportPermissionsNotForSpecialSubs(t *testing.T) {
 	// The deny is totally restrictive, but make sure that we still accept the $LDS, $GR and _GR_ go from LN1.
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
 		// We should have registered the 3 subs from the accepting leafnode.
-		if n := ln2.globalAccount().TotalSubs(); n != 3 {
-			return fmt.Errorf("Expected %d subs, got %v", 3, n)
+		if n := ln2.globalAccount().TotalSubs(); n != 7 {
+			return fmt.Errorf("Expected %d subs, got %v", 7, n)
 		}
 		return nil
 	})
@@ -2483,7 +2496,9 @@ func TestLeafNodeOperatorBadCfg(t *testing.T) {
 			authorization {
 				account: notankey
 			}`,
-		`operator mode requires account nkeys in remotes`: `remotes: [{url: u}]`,
+		("operator mode requires account nkeys in remotes. " +
+			"Please add an `account` key to each remote in your `leafnodes` section, to assign it to an account. " +
+			"Each account value should be a 56 character public key, starting with the letter 'A'"): `remotes: [{url: u}]`,
 	} {
 		t.Run(errorText, func(t *testing.T) {
 			conf := createConfFile(t, []byte(fmt.Sprintf(`
@@ -3172,6 +3187,55 @@ func TestLeafNodeWSNoBufferCorruption(t *testing.T) {
 	checkMsgRcv(sub)
 }
 
+func TestLeafNodeWSRemoteNoTLSBlockWithWSSProto(t *testing.T) {
+	o := testDefaultLeafNodeWSOptions()
+	o.Websocket.NoTLS = false
+	tc := &TLSConfigOpts{
+		CertFile: "../test/configs/certs/server-cert.pem",
+		KeyFile:  "../test/configs/certs/server-key.pem",
+		CaFile:   "../test/configs/certs/ca.pem",
+	}
+	tlsConf, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating TLS config: %v", err)
+	}
+	o.Websocket.TLSConfig = tlsConf
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	// The test will make sure that if the protocol is "wss://", a TLS handshake must
+	// be initiated, regardless of the presence of a TLS config block in config file
+	// or here directly.
+	// A bug was causing the absence of TLS config block to initiate a non TLS connection
+	// even if "wss://" proto was specified, which would lead to "invalid websocket connection"
+	// errors in the log.
+	// With the fix, the connection will fail because the remote will fail to verify
+	// the root CA, but at least, we will make sure that this is not an "invalid websocket connection"
+
+	u, _ := url.Parse(fmt.Sprintf("wss://127.0.0.1:%d/some/path", o.Websocket.Port))
+	lo := DefaultOptions()
+	lo.Cluster.Name = "LN"
+	remote := &RemoteLeafOpts{URLs: []*url.URL{u}}
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+	lo.LeafNode.ReconnectInterval = 100 * time.Millisecond
+	ln := RunServer(lo)
+	defer ln.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 10)}
+	ln.SetLogger(l, false, false)
+
+	select {
+	case e := <-l.errCh:
+		if strings.Contains(e, "invalid websocket connection") {
+			t.Fatalf("The remote did not try to create a TLS connection: %v", e)
+		}
+		// OK!
+		return
+	case <-time.After(2 * time.Second):
+		t.Fatal("Connection should fail")
+	}
+}
+
 func TestLeafNodeStreamImport(t *testing.T) {
 	o1 := DefaultOptions()
 	o1.LeafNode.Port = -1
@@ -3269,8 +3333,8 @@ func TestLeafNodeRouteSubWithOrigin(t *testing.T) {
 	r1.Shutdown()
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
 		acc := l2.GlobalAccount()
-		if n := acc.TotalSubs(); n != 0 {
-			return fmt.Errorf("Account %q should have 0 sub, got %v", acc.GetName(), n)
+		if n := acc.TotalSubs(); n != 3 {
+			return fmt.Errorf("Account %q should have 3 subs, got %v", acc.GetName(), n)
 		}
 		return nil
 	})
@@ -3681,4 +3745,309 @@ func TestLeafNodeNoMsgLoop(t *testing.T) {
 			// OK
 		}
 	}
+}
+
+func TestLeafNodeUniqueServerNameCrossJSDomain(t *testing.T) {
+	name := "NOT-UNIQUE"
+	test := func(s *Server, sIdExpected string, srvs ...*Server) {
+		ids := map[string]string{}
+		for _, srv := range srvs {
+			checkLeafNodeConnectedCount(t, srv, 2)
+			ids[srv.ID()] = srv.opts.JetStreamDomain
+		}
+		// ensure that an update for every server was received
+		sysNc := natsConnect(t, fmt.Sprintf("nats://admin:s3cr3t!@127.0.0.1:%d", s.opts.Port))
+		defer sysNc.Close()
+		sub, err := sysNc.SubscribeSync(fmt.Sprintf(serverStatsSubj, "*"))
+		require_NoError(t, err)
+		for {
+			m, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			tk := strings.Split(m.Subject, ".")
+			if domain, ok := ids[tk[2]]; ok {
+				delete(ids, tk[2])
+				require_Contains(t, string(m.Data), fmt.Sprintf(`"domain":"%s"`, domain))
+			}
+			if len(ids) == 0 {
+				break
+			}
+		}
+		cnt := 0
+		s.nodeToInfo.Range(func(key, value interface{}) bool {
+			cnt++
+			require_Equal(t, value.(nodeInfo).name, name)
+			require_Equal(t, value.(nodeInfo).id, sIdExpected)
+			return true
+		})
+		require_True(t, cnt == 1)
+	}
+	tmplA := `
+		listen: -1
+		server_name: %s
+		jetstream {
+			max_mem_store: 256MB,
+			max_file_store: 2GB,
+			store_dir: "%s",
+			domain: hub
+		}
+		accounts {
+			JSY { users = [ { user: "y", pass: "p" } ]; jetstream: true }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		leaf {
+			port: -1
+		}
+    `
+	tmplL := `
+		listen: -1
+		server_name: %s
+		jetstream {
+			max_mem_store: 256MB,
+			max_file_store: 2GB,
+			store_dir: "%s",
+			domain: %s
+		}
+		accounts {
+			JSY { users = [ { user: "y", pass: "p" } ]; jetstream: true }
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+		leaf {
+			remotes [
+				{ urls: [ %s ], account: "JSY" }
+				{ urls: [ %s ], account: "$SYS" }
+			]
+		}
+    `
+	t.Run("same-domain", func(t *testing.T) {
+		confA := createConfFile(t, []byte(fmt.Sprintf(tmplA, name, createDir(t, JetStreamStoreDir))))
+		defer removeFile(t, confA)
+		sA, oA := RunServerWithConfig(confA)
+		defer sA.Shutdown()
+		// using same domain as sA
+		confL := createConfFile(t, []byte(fmt.Sprintf(tmplL, name, createDir(t, JetStreamStoreDir), "hub",
+			fmt.Sprintf("nats://y:p@127.0.0.1:%d", oA.LeafNode.Port),
+			fmt.Sprintf("nats://admin:s3cr3t!@127.0.0.1:%d", oA.LeafNode.Port))))
+		defer removeFile(t, confL)
+		sL, _ := RunServerWithConfig(confL)
+		defer sL.Shutdown()
+		// as server name uniqueness is violates, sL.ID() is the expected value
+		test(sA, sL.ID(), sA, sL)
+	})
+	t.Run("different-domain", func(t *testing.T) {
+		confA := createConfFile(t, []byte(fmt.Sprintf(tmplA, name, createDir(t, JetStreamStoreDir))))
+		defer removeFile(t, confA)
+		sA, oA := RunServerWithConfig(confA)
+		defer sA.Shutdown()
+		// using different domain as sA
+		confL := createConfFile(t, []byte(fmt.Sprintf(tmplL, name, createDir(t, JetStreamStoreDir), "spoke",
+			fmt.Sprintf("nats://y:p@127.0.0.1:%d", oA.LeafNode.Port),
+			fmt.Sprintf("nats://admin:s3cr3t!@127.0.0.1:%d", oA.LeafNode.Port))))
+		defer removeFile(t, confL)
+		sL, _ := RunServerWithConfig(confL)
+		defer sL.Shutdown()
+		checkLeafNodeConnectedCount(t, sL, 2)
+		checkLeafNodeConnectedCount(t, sA, 2)
+		// ensure sA contains only sA.ID
+		test(sA, sA.ID(), sA, sL)
+	})
+}
+
+func TestLeafNodeJwtPermsAndJetStreamDomains(t *testing.T) {
+	createAcc := func(js bool) (string, string, nkeys.KeyPair) {
+		kp, _ := nkeys.CreateAccount()
+		aPub, _ := kp.PublicKey()
+		claim := jwt.NewAccountClaims(aPub)
+		if js {
+			claim.Limits.JetStreamLimits = jwt.JetStreamLimits{
+				MemoryStorage: 1024 * 1024,
+				DiskStorage:   1024 * 1024,
+				Streams:       1, Consumer: 2}
+		}
+		aJwt, err := claim.Encode(oKp)
+		require_NoError(t, err)
+		return aPub, aJwt, kp
+	}
+	sysPub, sysJwt, sysKp := createAcc(false)
+	accPub, accJwt, accKp := createAcc(true)
+	noExpiration := time.Now().Add(time.Hour)
+	// create user for acc to be used in leaf node.
+	lnCreds := createUserWithLimit(t, accKp, noExpiration, func(j *jwt.UserPermissionLimits) {
+		j.Sub.Deny.Add("subdeny")
+		j.Pub.Deny.Add("pubdeny")
+	})
+	defer removeFile(t, lnCreds)
+	unlimitedCreds := createUserWithLimit(t, accKp, noExpiration, nil)
+	defer removeFile(t, unlimitedCreds)
+
+	sysCreds := createUserWithLimit(t, sysKp, noExpiration, nil)
+	defer removeFile(t, sysCreds)
+
+	tmplA := `
+operator: %s
+system_account: %s
+resolver: MEMORY
+resolver_preload: {
+  %s: %s
+  %s: %s
+}
+listen: localhost:-1
+leafnodes: {
+	listen: localhost:-1
+}
+jetstream :{
+    domain: "cluster"
+    store_dir: "%s"
+    max_mem: 100Mb
+    max_file: 100Mb
+}
+`
+
+	tmplL := `
+listen: localhost:-1
+accounts :{
+    A:{   jetstream: enable, users:[ {user:a1,password:a1}]},
+    SYS:{ users:[ {user:s1,password:s1}]},
+}
+system_account = SYS
+jetstream: {
+    domain: ln1
+    store_dir: %s
+    max_mem: 50Mb
+    max_file: 50Mb
+}
+leafnodes:{
+    remotes:[{ url:nats://localhost:%d, account: A, credentials: %s},
+			 { url:nats://localhost:%d, account: SYS, credentials: %s}]
+}
+`
+
+	confA := createConfFile(t, []byte(fmt.Sprintf(tmplA, ojwt, sysPub,
+		sysPub, sysJwt, accPub, accJwt,
+		createDir(t, JetStreamStoreDir))))
+	defer removeFile(t, confA)
+	sA, _ := RunServerWithConfig(confA)
+	defer sA.Shutdown()
+
+	confL := createConfFile(t, []byte(fmt.Sprintf(tmplL, createDir(t, JetStreamStoreDir),
+		sA.opts.LeafNode.Port, lnCreds, sA.opts.LeafNode.Port, sysCreds)))
+	defer removeFile(t, confL)
+	sL, _ := RunServerWithConfig(confL)
+	defer sL.Shutdown()
+
+	checkLeafNodeConnectedCount(t, sA, 2)
+	checkLeafNodeConnectedCount(t, sL, 2)
+
+	ncA := natsConnect(t, sA.ClientURL(), nats.UserCredentials(unlimitedCreds))
+	defer ncA.Close()
+
+	ncL := natsConnect(t, fmt.Sprintf("nats://a1:a1@localhost:%d", sL.opts.Port))
+	defer ncL.Close()
+
+	test := func(subject string, cSub, cPub *nats.Conn, remoteServerForSub *Server, accName string, pass bool) {
+		t.Helper()
+		sub, err := cSub.SubscribeSync(subject)
+		require_NoError(t, err)
+		require_NoError(t, cSub.Flush())
+		// ensure the subscription made it across, or if not sent due to sub deny, make sure it could have made it.
+		if remoteServerForSub == nil {
+			time.Sleep(200 * time.Millisecond)
+		} else {
+			checkSubInterest(t, remoteServerForSub, accName, subject, time.Second)
+		}
+		require_NoError(t, cPub.Publish(subject, []byte("hello world")))
+		require_NoError(t, cPub.Flush())
+		m, err := sub.NextMsg(500 * time.Millisecond)
+		if pass {
+			require_NoError(t, err)
+			require_True(t, m.Subject == subject)
+			require_Equal(t, string(m.Data), "hello world")
+		} else {
+			require_True(t, err == nats.ErrTimeout)
+		}
+	}
+
+	t.Run("sub-on-ln-pass", func(t *testing.T) {
+		test("sub", ncL, ncA, sA, accPub, true)
+	})
+	t.Run("sub-on-ln-fail", func(t *testing.T) {
+		test("subdeny", ncL, ncA, nil, "", false)
+	})
+	t.Run("pub-on-ln-pass", func(t *testing.T) {
+		test("pub", ncA, ncL, sL, "A", true)
+	})
+	t.Run("pub-on-ln-fail", func(t *testing.T) {
+		test("pubdeny", ncA, ncL, nil, "A", false)
+	})
+}
+
+func TestLeafNodeInterestPropagationDaisychain(t *testing.T) {
+	aTmpl := `
+		port: %d
+		leafnodes {
+			port: %d
+		   }
+		}`
+
+	confA := createConfFile(t, []byte(fmt.Sprintf(aTmpl, -1, -1)))
+	defer removeFile(t, confA)
+	sA, _ := RunServerWithConfig(confA)
+	defer sA.Shutdown()
+
+	aPort := sA.opts.Port
+	aLeafPort := sA.opts.LeafNode.Port
+
+	confB := createConfFile(t, []byte(fmt.Sprintf(`
+		port: -1
+		leafnodes {
+			port: -1
+			remotes = [{
+				url:"nats://127.0.0.1:%d"
+			}]
+		}`, aLeafPort)))
+	defer removeFile(t, confB)
+	sB, _ := RunServerWithConfig(confB)
+	defer sB.Shutdown()
+
+	confC := createConfFile(t, []byte(fmt.Sprintf(`
+		port: -1
+		leafnodes {
+			port: -1
+			remotes = [{url:"nats://127.0.0.1:%d"}]
+		}`, sB.opts.LeafNode.Port)))
+	defer removeFile(t, confC)
+	sC, _ := RunServerWithConfig(confC)
+	defer sC.Shutdown()
+
+	checkLeafNodeConnectedCount(t, sC, 1)
+	checkLeafNodeConnectedCount(t, sB, 2)
+	checkLeafNodeConnectedCount(t, sA, 1)
+
+	ncC := natsConnect(t, sC.ClientURL())
+	defer ncC.Close()
+	_, err := ncC.SubscribeSync("foo")
+	require_NoError(t, err)
+	require_NoError(t, ncC.Flush())
+
+	checkSubInterest(t, sC, "$G", "foo", time.Second)
+	checkSubInterest(t, sB, "$G", "foo", time.Second)
+	checkSubInterest(t, sA, "$G", "foo", time.Second)
+
+	ncA := natsConnect(t, sA.ClientURL())
+	defer ncA.Close()
+
+	sA.Shutdown()
+	sA.WaitForShutdown()
+
+	confAA := createConfFile(t, []byte(fmt.Sprintf(aTmpl, aPort, aLeafPort)))
+	defer removeFile(t, confAA)
+	sAA, _ := RunServerWithConfig(confAA)
+	defer sAA.Shutdown()
+
+	checkLeafNodeConnectedCount(t, sAA, 1)
+	checkLeafNodeConnectedCount(t, sB, 2)
+	checkLeafNodeConnectedCount(t, sC, 1)
+
+	checkSubInterest(t, sC, "$G", "foo", time.Second)
+	checkSubInterest(t, sB, "$G", "foo", time.Second)
+	checkSubInterest(t, sAA, "$G", "foo", time.Second) // failure issue 2448
 }

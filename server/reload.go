@@ -1345,6 +1345,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 				s.Warnf("Can't start JetStream: %v", err)
 			}
 		}
+		// Make sure to reset the internal loop's version of JS.
+		s.resetInternalLoopInfo()
+		s.sendStatszUpdate()
 	}
 
 	// For remote gateways and leafnodes, make sure that their TLS configuration
@@ -1366,6 +1369,21 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 	}
 
 	s.Noticef("Reloaded server configuration")
+}
+
+// This will send a reset to the internal send loop.
+func (s *Server) resetInternalLoopInfo() {
+	var resetCh chan struct{}
+	s.mu.Lock()
+	if s.sys != nil {
+		// can't hold the lock as go routine reading it may be waiting for lock as well
+		resetCh = s.sys.resetCh
+	}
+	s.mu.Unlock()
+
+	if resetCh != nil {
+		resetCh <- struct{}{}
+	}
 }
 
 // Update all cached debug and trace settings for every client
@@ -1596,7 +1614,6 @@ func (s *Server) reloadAuthorization() {
 
 	// We will double check all JetStream configs on a reload.
 	if checkJetStream {
-		s.getJetStream().clearResources()
 		if err := s.enableJetStreamAccounts(); err != nil {
 			s.Errorf(err.Error())
 		}
@@ -1704,7 +1721,7 @@ func (s *Server) reloadClusterPermissions(oldPerms *RoutePermissions) {
 		deleteRoutedSubs []*subscription
 	)
 	// FIXME(dlc) - Change for accounts.
-	gacc.sl.localSubs(&localSubs)
+	gacc.sl.localSubs(&localSubs, false)
 
 	// Go through all local subscriptions
 	for _, sub := range localSubs {

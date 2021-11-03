@@ -54,8 +54,8 @@ func (tr *testReader) Read(p []byte) (int, error) {
 	if n == 0 {
 		return 0, nil
 	}
-	if n > cap(p) {
-		n = cap(p)
+	if n > len(p) {
+		n = len(p)
 	}
 	if tr.max > 0 && n > tr.max {
 		n = tr.max
@@ -725,6 +725,97 @@ func TestWSReadControlFrameBetweebFragmentedFrames(t *testing.T) {
 	}
 	if string(bufs[1]) != "second" {
 		t.Fatalf("Unexpected content: %s", bufs[1])
+	}
+}
+
+func TestWSCloseFrameWithPartialOrInvalid(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	// a close message has a status in 2 bytes + optional payload
+	payloadTxt := []byte("hello")
+	payload := make([]byte, 2+len(payloadTxt))
+	binary.BigEndian.PutUint16(payload[:2], wsCloseStatusNormalClosure)
+	copy(payload[2:], payloadTxt)
+	closeMsg := testWSCreateClientMsg(wsCloseMessage, 1, true, false, payload)
+
+	// We will pass to wsRead a buffer of small capacity that contains
+	// only 1 byte.
+	closeFirtByte := []byte{closeMsg[0]}
+	// Make the io reader return the rest of the frame
+	tr.buf = closeMsg[1:]
+	bufs, err := c.wsRead(ri, tr, closeFirtByte[:])
+	// It is expected that wsRead returns io.EOF on processing a close.
+	if err != io.EOF {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 0 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	// A CLOSE should have been queued with the payload of the original close message.
+	c.mu.Lock()
+	nb, _ := c.collapsePtoNB()
+	c.mu.Unlock()
+	if n := len(nb); n == 0 {
+		t.Fatalf("Expected buffers, got %v", n)
+	}
+	if expected := 2 + 2 + len(payloadTxt); expected != len(nb[0]) {
+		t.Fatalf("Expected buffer to be %v bytes long, got %v", expected, len(nb[0]))
+	}
+	b := nb[0][0]
+	if b&wsFinalBit == 0 {
+		t.Fatalf("Control frame should have been the final flag, it was not set: %v", b)
+	}
+	if b&byte(wsCloseMessage) == 0 {
+		t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+	}
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusNormalClosure {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusNormalClosure, status)
+	}
+	if !bytes.Equal(nb[0][4:], payloadTxt) {
+		t.Fatalf("Unexpected content: %s", nb[0][4:])
+	}
+
+	// Now test close with invalid status size (1 instead of 2 bytes)
+	c, ri, tr = testWSSetupForRead()
+	payload[0] = 100
+	binary.BigEndian.PutUint16(payload, wsCloseStatusNormalClosure)
+	closeMsg = testWSCreateClientMsg(wsCloseMessage, 1, true, false, payload[:1])
+
+	// We will pass to wsRead a buffer of small capacity that contains
+	// only 1 byte.
+	closeFirtByte = []byte{closeMsg[0]}
+	// Make the io reader return the rest of the frame
+	tr.buf = closeMsg[1:]
+	bufs, err = c.wsRead(ri, tr, closeFirtByte[:])
+	// It is expected that wsRead returns io.EOF on processing a close.
+	if err != io.EOF {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 0 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	// A CLOSE should have been queued with the payload of the original close message.
+	c.mu.Lock()
+	nb, _ = c.collapsePtoNB()
+	c.mu.Unlock()
+	if n := len(nb); n == 0 {
+		t.Fatalf("Expected buffers, got %v", n)
+	}
+	if expected := 2 + 2; expected != len(nb[0]) {
+		t.Fatalf("Expected buffer to be %v bytes long, got %v", expected, len(nb[0]))
+	}
+	b = nb[0][0]
+	if b&wsFinalBit == 0 {
+		t.Fatalf("Control frame should have been the final flag, it was not set: %v", b)
+	}
+	if b&byte(wsCloseMessage) == 0 {
+		t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+	}
+	// Since satus was not valid, we should get wsCloseStatusNoStatusReceived
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusNoStatusReceived {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusNoStatusReceived, status)
+	}
+	if len(nb[0][:]) != 4 {
+		t.Fatalf("Unexpected content: %s", nb[0][2:])
 	}
 }
 
@@ -2291,7 +2382,7 @@ func TestWSServerReportUpgradeFailure(t *testing.T) {
 	logger := &captureErrorLogger{errCh: make(chan string, 1)}
 	s.SetLogger(logger, false, false)
 
-	addr := fmt.Sprintf("%s:%d", o.Websocket.Host, o.Websocket.Port)
+	addr := fmt.Sprintf("127.0.0.1:%d", o.Websocket.Port)
 	req := testWSCreateValidReq()
 	req.URL, _ = url.Parse("wss://" + addr)
 
@@ -2325,6 +2416,11 @@ func TestWSServerReportUpgradeFailure(t *testing.T) {
 	case e := <-logger.errCh:
 		if !strings.Contains(e, "invalid value for header 'Connection'") {
 			t.Fatalf("Unexpected error: %v", e)
+		}
+		// The client IP's local should be printed as a remote from server perspective.
+		clientIP := wsc.LocalAddr().String()
+		if !strings.HasPrefix(e, clientIP) {
+			t.Fatalf("IP should have been logged, it was not: %v", e)
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("Should have timed-out")
@@ -2747,7 +2843,7 @@ func TestWSCompressionBasic(t *testing.T) {
 	cbuf := &bytes.Buffer{}
 	compressor, _ := flate.NewWriter(cbuf, flate.BestSpeed)
 	compressor.Write([]byte(msgProto))
-	compressor.Close()
+	compressor.Flush()
 	compressed := cbuf.Bytes()
 	// The last 4 bytes are dropped
 	compressed = compressed[:len(compressed)-4]
@@ -2815,6 +2911,29 @@ func TestWSCompressionBasic(t *testing.T) {
 	}
 	if !bytes.Equal(body, compressed) {
 		t.Fatalf("Unexpected compress body: %q", body)
+	}
+
+	wc.mu.Lock()
+	wc.buf.Reset()
+	wc.mu.Unlock()
+
+	payload = "small"
+	natsPub(t, nc, "foo", []byte(payload))
+	msgProto = fmt.Sprintf("MSG foo 1 %d\r\n%s\r\n", len(payload), payload)
+	res = &bytes.Buffer{}
+	for total := 0; total < len(msgProto); {
+		l := testWSReadFrame(t, br)
+		n, _ := res.Write(l)
+		total += n
+	}
+	if !bytes.Equal([]byte(msgProto), res.Bytes()) {
+		t.Fatalf("Unexpected result: %q", res)
+	}
+	wc.mu.RLock()
+	res = wc.buf
+	wc.mu.RUnlock()
+	if !bytes.HasSuffix(res.Bytes(), []byte(msgProto)) {
+		t.Fatalf("Looks like frame was compressed: %q", res.Bytes())
 	}
 }
 
@@ -2910,15 +3029,16 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		maskWrite bool
+		noLimit   bool
 	}{
-		{"no write masking", false},
-		{"write masking", true},
+		{"no write masking", false, false},
+		{"write masking", true, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			opts := testWSOptions()
 			opts.MaxPending = MAX_PENDING_SIZE
 			s := &Server{opts: opts}
-			c := &client{srv: s, ws: &websocket{compress: true, browser: true, maskwrite: test.maskWrite}}
+			c := &client{srv: s, ws: &websocket{compress: true, browser: true, nocompfrag: test.noLimit, maskwrite: test.maskWrite}}
 			c.initClient()
 
 			uncompressedPayload := make([]byte, 2*wsFrameSizeForBrowsers)
@@ -2931,13 +3051,19 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 			nb, _ := c.collapsePtoNB()
 			c.mu.Unlock()
 
+			if test.noLimit && len(nb) != 2 {
+				t.Fatalf("There should be only 2 buffers, the header and payload, got %v", len(nb))
+			}
+
 			bb := &bytes.Buffer{}
 			var key []byte
 			for i, b := range nb {
-				// frame header buffer are always very small. The payload should not be more
-				// than 10 bytes since that is what we passed as the limit.
-				if len(b) > wsFrameSizeForBrowsers {
-					t.Fatalf("Frame size too big: %v (%q)", len(b), b)
+				if !test.noLimit {
+					// frame header buffer are always very small. The payload should not be more
+					// than 10 bytes since that is what we passed as the limit.
+					if len(b) > wsFrameSizeForBrowsers {
+						t.Fatalf("Frame size too big: %v (%q)", len(b), b)
+					}
 				}
 				if test.maskWrite {
 					if i%2 == 0 {
@@ -2957,6 +3083,13 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 						t.Fatalf("Compressed bit missing")
 					}
 				} else {
+					if test.noLimit {
+						// Since the payload is likely not well compressed, we are expecting
+						// the length to be > wsFrameSizeForBrowsers
+						if len(b) <= wsFrameSizeForBrowsers {
+							t.Fatalf("Expected frame to be bigger, got %v", len(b))
+						}
+					}
 					// Collect the payload
 					bb.Write(b)
 				}

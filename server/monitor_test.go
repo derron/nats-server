@@ -206,6 +206,7 @@ func TestVarzSubscriptionsResetProperly(t *testing.T) {
 	opts := DefaultMonitorOptions()
 	opts.JetStream = true
 	s := RunServer(opts)
+	defer s.Shutdown()
 
 	// This bug seems to only happen via the http endpoint, not direct calls.
 	// Every time you call it doubles.
@@ -2808,6 +2809,59 @@ func TestMonitorGatewayURLsUpdated(t *testing.T) {
 		}
 		return nil
 	})
+
+	// Now stop sb2 and make sure that its removal is reflected in varz.
+	sb2.Shutdown()
+	// Wait for it to disappear from sa.
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	// Now check that URLs in /varz get updated.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, sa, mode, varzURL, nil)
+			if n := len(v.Gateway.Gateways); n != 1 {
+				return fmt.Errorf("mode=%v - Expected 1 remote gateway, got %v", mode, n)
+			}
+			gw := v.Gateway.Gateways[0]
+			if n := len(gw.URLs); n != 1 {
+				return fmt.Errorf("mode=%v - Expected 1 url, got %v", mode, n)
+			}
+			u := gw.URLs[0]
+			if u != fmt.Sprintf("127.0.0.1:%d", sb1.GatewayAddr().Port) {
+				return fmt.Errorf("mode=%v - Did not get URL to sb1", mode)
+			}
+		}
+		return nil
+	})
+}
+
+func TestMonitorGatewayReportItsOwnURLs(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	// In this test, we show that if a server has its own gateway information
+	// as a remote (which is the case when remote gateway definitions is copied
+	// on all clusters), we display the defined URLs.
+	oa := testGatewayOptionsFromToWithURLs(t, "A", "A", []string{"nats://127.0.0.1:1234", "nats://127.0.0.1:1235"})
+	oa.HTTPHost = "127.0.0.1"
+	oa.HTTPPort = MONITOR_PORT
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", sa.MonitorAddr().Port)
+	// Check the /varz gateway's URLs
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, sa, mode, varzURL, nil)
+		if n := len(v.Gateway.Gateways); n != 1 {
+			t.Fatalf("mode=%v - Expected 1 remote gateway, got %v", mode, n)
+		}
+		gw := v.Gateway.Gateways[0]
+		if n := len(gw.URLs); n != 2 {
+			t.Fatalf("mode=%v - Expected 2 urls, got %v", mode, gw.URLs)
+		}
+		expected := []string{"127.0.0.1:1234", "127.0.0.1:1235"}
+		if !reflect.DeepEqual(gw.URLs, expected) {
+			t.Fatalf("mode=%v - Expected URLs %q, got %q", mode, expected, gw.URLs)
+		}
+	}
 }
 
 func TestMonitorLeafNode(t *testing.T) {
@@ -3784,8 +3838,8 @@ func TestMonitorLeafz(t *testing.T) {
 				t.Fatalf("RTT not tracked?")
 			}
 			// LDS should be only one.
-			if ln.NumSubs != 1 || len(ln.Subs) != 1 {
-				t.Fatalf("Expected 1 sub, got %v (%v)", ln.NumSubs, ln.Subs)
+			if ln.NumSubs != 3 || len(ln.Subs) != 3 {
+				t.Fatalf("Expected 3 subs, got %v (%v)", ln.NumSubs, ln.Subs)
 			}
 		}
 	}
@@ -3958,7 +4012,7 @@ func TestMonitorJsz(t *testing.T) {
 			}
 			ACC {
 				users [{user: usr, password: pwd}]
-				jetstream: enabled
+				jetstream: {max_store: 4Mb, max_memory: 5Mb}
 			}
 			BCC_TO_HAVE_ONE_EXTRA {
 				users [{user: usr2, password: pwd}]
@@ -4032,6 +4086,12 @@ func TestMonitorJsz(t *testing.T) {
 			}
 			if info.Messages != 1 {
 				t.Fatalf("expected one message but got %d", info.Messages)
+			}
+			if info.ReservedStore != 4*1024*1024 {
+				t.Fatalf("expected 4Mb reserved, got %d bytes", info.ReservedStore)
+			}
+			if info.ReservedMemory != 5*1024*1024 {
+				t.Fatalf("expected 5Mb reserved, got %d bytes", info.ReservedStore)
 			}
 		}
 	})
@@ -4145,4 +4205,108 @@ func TestMonitorJsz(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestMonitorJszAccountReserves(t *testing.T) {
+	readJsInfo := func(url string) *JSInfo {
+		t.Helper()
+		body := readBody(t, url)
+		info := &JSInfo{}
+		err := json.Unmarshal(body, info)
+		require_NoError(t, err)
+		return info
+	}
+	tmpDir := createDir(t, "srv")
+	defer removeDir(t, tmpDir)
+	tmplCfg := `
+		listen: 127.0.0.1:-1
+		http_port: 7501
+		system_account: SYS
+		jetstream: {
+			store_dir: %s
+		}
+		accounts {
+			SYS { users [{user: sys, password: pwd}] }
+			ACC {
+				users [{user: usr, password: pwd}]
+				%s
+			}
+		}`
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmplCfg, tmpDir, "jetstream: enabled")))
+	defer removeFile(t, conf)
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+	checkForJSClusterUp(t, s)
+
+	nc := natsConnect(t, fmt.Sprintf("nats://usr:pwd@127.0.0.1:%d", s.opts.Port))
+	defer nc.Close()
+	js, err := nc.JetStream(nats.MaxWait(5 * time.Second))
+	require_NoError(t, err)
+	for _, v := range []struct {
+		subject string
+		storage nats.StorageType
+	}{
+		{"file", nats.FileStorage},
+		{"mem", nats.MemoryStorage}} {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     v.subject,
+			Subjects: []string{v.subject},
+			Replicas: 1,
+			Storage:  v.storage,
+		})
+		require_NoError(t, err)
+		require_NoError(t, nc.Flush())
+	}
+
+	send := func() {
+		for _, subj := range []string{"file", "mem"} {
+			_, err = js.Publish(subj, []byte("hello world "+subj))
+			require_NoError(t, err)
+		}
+		require_NoError(t, nc.Flush())
+	}
+
+	test := func(msgs, reservedMemory, reservedStore uint64, totalIsReserveUsd bool) {
+		t.Helper()
+		info := readJsInfo(fmt.Sprintf("http://127.0.0.1:%d/jsz", s.opts.HTTPPort))
+		if info.Streams != 2 {
+			t.Fatalf("expected stream count to be 1 but got %d", info.Streams)
+		}
+		if info.Messages != msgs {
+			t.Fatalf("expected one message but got %d", info.Messages)
+		}
+		if info.ReservedStore != reservedStore {
+			t.Fatalf("expected %d bytes reserved, got %d bytes", reservedStore, info.ReservedStore)
+		}
+		if info.ReservedMemory != reservedMemory {
+			t.Fatalf("expected %d bytes reserved, got %d bytes", reservedMemory, info.ReservedStore)
+		}
+		if info.Memory == 0 {
+			t.Fatalf("memory expected to be not 0")
+		}
+		if info.Store == 0 {
+			t.Fatalf("store expected to be not 0")
+		}
+		memory, store := uint64(0), uint64(0)
+		if totalIsReserveUsd {
+			memory = info.Memory
+			store = info.Store
+		}
+		if info.ReservedMemoryUsed != memory {
+			t.Fatalf("expected %d bytes reserved memory used, got %d bytes", memory, info.ReservedMemoryUsed)
+		}
+		if info.ReserveStoreUsed != store {
+			t.Fatalf("expected %d bytes reserved store used, got %d bytes", store, info.ReserveStoreUsed)
+		}
+	}
+
+	send()
+	test(2, 0, 0, false)
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmplCfg, tmpDir, "jetstream: {max_mem: 4Mb, max_store: 5Mb}"))
+	test(2, 4*1024*1024, 5*1024*1024, true)
+	send()
+	test(4, 4*1024*1024, 5*1024*1024, true)
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmplCfg, tmpDir, "jetstream: enabled"))
+	test(4, 0, 0, false)
 }

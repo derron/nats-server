@@ -440,7 +440,7 @@ func TestLeafNodeAndRoutes(t *testing.T) {
 	lc := createLeafConn(t, optsA.LeafNode.Host, optsA.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupLeaf(t, lc, 1)
+	leafSend, leafExpect := setupLeaf(t, lc, 4)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -675,7 +675,7 @@ func waitForOutboundGateways(t *testing.T, s *server.Server, expected int, timeo
 	}
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		if n := s.NumOutboundGateways(); n != expected {
-			return fmt.Errorf("Expected %v outbound gateway(s), got %v (ulimt -n too low?)",
+			return fmt.Errorf("Expected %v outbound gateway(s), got %v (ulimit -n too low?)",
 				expected, n)
 		}
 		return nil
@@ -834,7 +834,7 @@ func TestLeafNodeGatewaySendsSystemEvent(t *testing.T) {
 	defer lc.Close()
 
 	// This is for our global responses since we are setting up GWs above.
-	leafSend, leafExpect := setupLeaf(t, lc, 3)
+	leafSend, leafExpect := setupLeaf(t, lc, 6)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -878,14 +878,14 @@ func TestLeafNodeGatewayInterestPropagation(t *testing.T) {
 	buf := leafExpect(infoRe)
 	buf = infoRe.ReplaceAll(buf, []byte(nil))
 	foundFoo := false
-	for count := 0; count != 5; {
+	for count := 0; count != 8; {
 		// skip first time if we still have data (buf from above may already have some left)
 		if count != 0 || len(buf) == 0 {
 			buf = append(buf, leafExpect(anyRe)...)
 		}
 		count += len(lsubRe.FindAllSubmatch(buf, -1))
-		if count > 5 {
-			t.Fatalf("Expected %v matches, got %v (buf=%s)", 4, count, buf)
+		if count > 8 {
+			t.Fatalf("Expected %v matches, got %v (buf=%s)", 8, count, buf)
 		}
 		if strings.Contains(string(buf), "foo") {
 			foundFoo = true
@@ -937,7 +937,7 @@ func TestLeafNodeWithRouteAndGateway(t *testing.T) {
 	defer lc.Close()
 
 	// This is for our global responses since we are setting up GWs above.
-	leafSend, leafExpect := setupLeaf(t, lc, 3)
+	leafSend, leafExpect := setupLeaf(t, lc, 6)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -996,7 +996,7 @@ func TestLeafNodeWithGatewaysAndStaggeredStart(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupLeaf(t, lc, 3)
+	leafSend, leafExpect := setupLeaf(t, lc, 6)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -1036,7 +1036,7 @@ func TestLeafNodeWithGatewaysServerRestart(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupLeaf(t, lc, 3)
+	leafSend, leafExpect := setupLeaf(t, lc, 6)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -1070,7 +1070,7 @@ func TestLeafNodeWithGatewaysServerRestart(t *testing.T) {
 	lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	_, leafExpect = setupLeaf(t, lc, 3)
+	_, leafExpect = setupLeaf(t, lc, 6)
 
 	// Now wait on GW solicit to fire
 	time.Sleep(500 * time.Millisecond)
@@ -1174,7 +1174,7 @@ func TestLeafNodeBasicAuth(t *testing.T) {
 	leafExpect(infoRe)
 	leafExpect(lsubRe)
 	leafSend("PING\r\n")
-	leafExpect(pongRe)
+	expectResult(t, lc, pongRe)
 
 	checkLeafNodeConnected(t, s)
 }
@@ -1337,6 +1337,7 @@ func runLeafNodeOperatorServer(t *testing.T) (*server.Server, *server.Options, s
 	t.Helper()
 	content := `
 	port: -1
+	server_name: OP
 	operator = "./configs/nkeys/op.jwt"
 	resolver = MEMORY
 	listen: "127.0.0.1:-1"
@@ -1485,7 +1486,6 @@ func TestLeafNodeUserPermsForConnection(t *testing.T) {
 	defer nc2.Close()
 
 	// Make sure subscriptions properly do or do not make it to the hub.
-	// Note that all hub subscriptions will make it to the leafnode.
 	nc2.SubscribeSync("bar")
 	checkNoSubInterest(t, s, acc.GetName(), "bar", 20*time.Millisecond)
 	// This one should.
@@ -1576,7 +1576,7 @@ func TestLeafNodeMultipleAccounts(t *testing.T) {
 
 	// Wait for the subs to propagate. LDS + foo.test
 	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
-		if subs := s.NumSubscriptions(); subs < 2 {
+		if subs := s.NumSubscriptions(); subs < 4 {
 			return fmt.Errorf("Number of subs is %d", subs)
 		}
 		return nil
@@ -1588,6 +1588,155 @@ func TestLeafNodeMultipleAccounts(t *testing.T) {
 	_, err = lsub.NextMsg(1 * time.Second)
 	if err != nil {
 		t.Fatalf("Error during wait for next message: %s", err)
+	}
+}
+
+func TestLeafNodeOperatorAndPermissions(t *testing.T) {
+	s, opts, conf := runLeafNodeOperatorServer(t)
+	defer os.Remove(conf)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(t, s)
+	kp, _ := nkeys.CreateUser()
+	pub, _ := kp.PublicKey()
+
+	// Create SRV user, with no limitations
+	srvnuc := jwt.NewUserClaims(pub)
+	srvujwt, err := srvnuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+	seed, _ := kp.Seed()
+	srvcreds := genCredsFile(t, srvujwt, seed)
+	defer os.Remove(srvcreds)
+
+	// Create connection for SRV
+	srvnc, err := nats.Connect(s.ClientURL(), nats.UserCredentials(srvcreds))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer srvnc.Close()
+
+	// Create on the server "s" a subscription on "*" and on "foo".
+	// We check that the subscription on "*" will be able to receive
+	// messages since LEAF has publish permissions on "foo", so msg
+	// should be received.
+	srvsubStar, err := srvnc.SubscribeSync("*")
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	srvsubFoo, err := srvnc.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	srvnc.Flush()
+
+	// Create LEAF user, with pub perms on "foo" and sub perms on "bar"
+	leafnuc := jwt.NewUserClaims(pub)
+	leafnuc.Permissions.Pub.Allow.Add("foo")
+	leafnuc.Permissions.Sub.Allow.Add("bar")
+	leafnuc.Permissions.Sub.Allow.Add("baz")
+	leafujwt, err := leafnuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+	leafcreds := genCredsFile(t, leafujwt, seed)
+	defer os.Remove(leafcreds)
+
+	content := `
+		port: -1
+		server_name: LN
+		leafnodes {
+			remotes = [
+				{
+					url: nats-leaf://127.0.0.1:%d
+					credentials: '%s'
+				}
+			]
+		}
+		`
+	config := fmt.Sprintf(content, opts.LeafNode.Port, leafcreds)
+	lnconf := createConfFile(t, []byte(config))
+	defer os.Remove(lnconf)
+	sl, _ := RunServerWithConfig(lnconf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	// Check that interest makes it to "sl" server.
+	// This helper does not check for wildcard interest...
+	checkSubInterest(t, sl, "$G", "foo", time.Second)
+
+	// Create connection for LEAF and subscribe on "bar"
+	leafnc, err := nats.Connect(sl.ClientURL(), nats.UserCredentials(leafcreds))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer leafnc.Close()
+
+	leafsub, err := leafnc.SubscribeSync("bar")
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// To check that we can pull in 'baz'.
+	leafsubpwc, err := leafnc.SubscribeSync("*")
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Make sure the interest on "bar" from "sl" server makes it to the "s" server.
+	checkSubInterest(t, s, acc.GetName(), "bar", time.Second)
+	// Check for local interest too.
+	checkSubInterest(t, sl, "$G", "bar", time.Second)
+
+	// Now that we know that "s" has received interest on "bar", create
+	// the sub on "bar" locally on "s"
+	srvsub, err := srvnc.SubscribeSync("bar")
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	srvnc.Publish("bar", []byte("hello"))
+	if _, err := srvsub.NextMsg(time.Second); err != nil {
+		t.Fatalf("SRV did not get message: %v", err)
+	}
+	if _, err := leafsub.NextMsg(time.Second); err != nil {
+		t.Fatalf("LEAF did not get message: %v", err)
+	}
+	if _, err := leafsubpwc.NextMsg(time.Second); err != nil {
+		t.Fatalf("LEAF did not get message: %v", err)
+	}
+
+	// The leafnode has a sub on '*', that should pull in a publish to 'baz'.
+	srvnc.Publish("baz", []byte("hello"))
+	if _, err := leafsubpwc.NextMsg(time.Second); err != nil {
+		t.Fatalf("LEAF did not get message: %v", err)
+	}
+
+	// User LEAF user on "sl" server, publish on "foo"
+	leafnc.Publish("foo", []byte("hello"))
+	// The user SRV on "s" receives it because the LN connection
+	// is allowed to publish on "foo".
+	if _, err := srvsubFoo.NextMsg(time.Second); err != nil {
+		t.Fatalf("SRV did not get message: %v", err)
+	}
+	// The wildcard subscription should get it too.
+	if _, err := srvsubStar.NextMsg(time.Second); err != nil {
+		t.Fatalf("SRV did not get message: %v", err)
+	}
+
+	// However, even when using an unrestricted user connects to "sl" and
+	// publishes on "bar", the user SRV on "s" should not receive it because
+	// the LN connection is not allowed to publish (send msg over) on "bar".
+	nc, err := nats.Connect(sl.ClientURL(), nats.UserCredentials(srvcreds))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+	nc.Publish("bar", []byte("should not received"))
+	if _, err := srvsub.NextMsg(250 * time.Millisecond); err == nil {
+		t.Fatal("Should not have received message")
 	}
 }
 
@@ -1760,7 +1909,7 @@ func TestLeafNodeExportsImports(t *testing.T) {
 
 	// Wait for all subs to propagate.
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if subs := s.NumSubscriptions(); subs < 3 {
+		if subs := s.NumSubscriptions(); subs < 5 {
 			return fmt.Errorf("Number of subs is %d", subs)
 		}
 		return nil
@@ -1924,8 +2073,8 @@ func TestLeafNodeExportImportComplexSetup(t *testing.T) {
 
 	// Wait for the sub to propagate to s2. LDS + subject above.
 	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		if acc1.RoutedSubs() != 2 {
-			return fmt.Errorf("Still no routed subscription")
+		if acc1.RoutedSubs() != 4 {
+			return fmt.Errorf("Still no routed subscription: %d", acc1.RoutedSubs())
 		}
 		return nil
 	})
@@ -2510,7 +2659,7 @@ func TestLeafNodeSwitchGatewayToInterestModeOnly(t *testing.T) {
 	defer lc.Close()
 
 	// This is for our global responses since we are setting up GWs above.
-	leafSend, leafExpect := setupLeaf(t, lc, 3)
+	leafSend, leafExpect := setupLeaf(t, lc, 6)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 }

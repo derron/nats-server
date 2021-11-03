@@ -130,6 +130,8 @@ func TestOCSPAlwaysMustStapleAndShutdown(t *testing.T) {
 	if err != nats.ErrNoServers {
 		t.Errorf("Expected connection refused")
 	}
+	// Verify that the server finishes shutdown
+	srv.WaitForShutdown()
 }
 
 func TestOCSPMustStapleShutdown(t *testing.T) {
@@ -274,6 +276,7 @@ func TestOCSPMustStapleAutoDoesNotShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer nc.Close()
 	sub, err := nc.SubscribeSync("foo")
 	if err != nil {
 		t.Fatal(err)
@@ -296,7 +299,7 @@ func TestOCSPMustStapleAutoDoesNotShutdown(t *testing.T) {
 
 	// Should not be connection refused, the client will continue running and
 	// be served the stale OCSP staple instead.
-	_, err = nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
+	nc, err = nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
 		nats.Secure(&tls.Config{
 			VerifyConnection: func(s tls.ConnectionState) error {
 				resp, err := getOCSPStatus(s)
@@ -315,6 +318,7 @@ func TestOCSPMustStapleAutoDoesNotShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	nc.Close()
 }
 
 func TestOCSPAutoWithoutMustStapleDoesNotShutdownOnRevoke(t *testing.T) {
@@ -378,6 +382,7 @@ func TestOCSPAutoWithoutMustStapleDoesNotShutdownOnRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer nc.Close()
 	sub, err := nc.SubscribeSync("foo")
 	if err != nil {
 		t.Fatal(err)
@@ -398,13 +403,14 @@ func TestOCSPAutoWithoutMustStapleDoesNotShutdownOnRevoke(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Should not be connection refused since server will continue running.
-	_, err = nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
+	nc, err = nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
 		nats.RootCAs(caCert),
 		nats.ErrorHandler(noOpErrHandler),
 	)
 	if err != nil {
 		t.Errorf("Unexpected error: %s", err)
 	}
+	nc.Close()
 }
 
 func TestOCSPClient(t *testing.T) {
@@ -1078,6 +1084,7 @@ func TestOCSPCluster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cA.Close()
 	checkClusterFormed(t, srvA, srvB)
 
 	// Revoke the seed server cluster certificate, following servers will not be able to verify connection.
@@ -1143,6 +1150,7 @@ func TestOCSPCluster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cB.Close()
 	cC, err := nats.Connect(fmt.Sprintf("tls://localhost:%d", optsC.Port),
 		nats.Secure(&tls.Config{
 			VerifyConnection: func(s tls.ConnectionState) error {
@@ -1158,6 +1166,7 @@ func TestOCSPCluster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cC.Close()
 
 	// There should be no connectivity between the clients due to the revoked staple.
 	_, err = cA.Subscribe("foo", func(m *nats.Msg) {
@@ -1343,6 +1352,7 @@ func TestOCSPLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cA.Close()
 	// checkLeafNodeConnected(t, srvA)
 
 	// Revoke the seed server cluster certificate, following servers will not be able to verify connection.
@@ -1402,6 +1412,7 @@ func TestOCSPLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cB.Close()
 	cC, err := nats.Connect(fmt.Sprintf("tls://127.0.0.1:%d", optsC.Port),
 		nats.Secure(&tls.Config{
 			VerifyConnection: func(s tls.ConnectionState) error {
@@ -1417,6 +1428,7 @@ func TestOCSPLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cC.Close()
 
 	// There should be no connectivity between the clients due to the revoked staple.
 	_, err = cA.Subscribe("foo", func(m *nats.Msg) {
@@ -1623,6 +1635,7 @@ func TestOCSPGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cA.Close()
 	waitForOutboundGateways(t, srvB, 1, 5*time.Second)
 
 	// Revoke the seed server cluster certificate, following servers will not be able to verify connection.
@@ -1685,6 +1698,7 @@ func TestOCSPGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cB.Close()
 	cC, err := nats.Connect(fmt.Sprintf("tls://127.0.0.1:%d", optsC.Port),
 		nats.Secure(&tls.Config{
 			VerifyConnection: func(s tls.ConnectionState) error {
@@ -1700,6 +1714,7 @@ func TestOCSPGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cC.Close()
 
 	// There should be no connectivity between the clients due to the revoked staple.
 	_, err = cA.Subscribe("foo", func(m *nats.Msg) {
@@ -2437,4 +2452,374 @@ func getOCSPStatus(s tls.ConnectionState) (*ocsp.Response, error) {
 		return resp, err
 	}
 	return resp, nil
+}
+
+func TestOCSPTLSConfigNoLeafSet(t *testing.T) {
+	o := DefaultTestOptions
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPSPort = -1
+	o.TLSConfig = &tls.Config{ServerName: "localhost"}
+	cert, err := tls.LoadX509KeyPair("configs/certs/server-cert.pem", "configs/certs/server-key.pem")
+	if err != nil {
+		t.Fatalf("Got error reading certificates: %s", err)
+	}
+	o.TLSConfig.Certificates = []tls.Certificate{cert}
+	s := RunServer(&o)
+	s.Shutdown()
+}
+
+func TestOCSPSuperCluster(t *testing.T) {
+	const (
+		caCert = "configs/certs/ocsp/ca-cert.pem"
+		caKey  = "configs/certs/ocsp/ca-key.pem"
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ocspr := newOCSPResponder(t, caCert, caKey)
+	defer ocspr.Shutdown(ctx)
+	addr := fmt.Sprintf("http://%s", ocspr.Addr)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-01-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-02-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-03-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-04-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-05-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-06-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-07-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-status-request-url-08-cert.pem", ocsp.Good)
+	setOCSPStatus(t, addr, "configs/certs/ocsp/server-cert.pem", ocsp.Good)
+
+	// Store Dirs
+	storeDirA := createDir(t, "_ocspA")
+	defer removeDir(t, storeDirA)
+	storeDirB := createDir(t, "_ocspB")
+	defer removeDir(t, storeDirB)
+	storeDirC := createDir(t, "_ocspC")
+	defer removeDir(t, storeDirC)
+	storeDirD := createDir(t, "_ocspD")
+	defer removeDir(t, storeDirD)
+
+	// Gateway server configuration
+	srvConfA := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "A"
+
+		ocsp { mode: "always" }
+
+		tls {
+			cert_file: "configs/certs/ocsp/server-status-request-url-01-cert.pem"
+			key_file: "configs/certs/ocsp/server-status-request-url-01-key.pem"
+			ca_file: "configs/certs/ocsp/ca-cert.pem"
+			timeout: 5
+		}
+		store_dir: "%s"
+
+		cluster {
+			name: A
+			host: "127.0.0.1"
+			advertise: 127.0.0.1
+			port: -1
+
+			tls {
+				cert_file: "configs/certs/ocsp/server-status-request-url-02-cert.pem"
+				key_file: "configs/certs/ocsp/server-status-request-url-02-key.pem"
+				ca_file: "configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+			}
+		}
+
+		gateway {
+			name: A
+			host: "127.0.0.1"
+			port: -1
+			advertise: "127.0.0.1"
+
+			tls {
+				cert_file: "configs/certs/ocsp/server-status-request-url-03-cert.pem"
+				key_file: "configs/certs/ocsp/server-status-request-url-03-key.pem"
+				ca_file: "configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+				verify: true
+			}
+		}
+	`
+	srvConfA = fmt.Sprintf(srvConfA, storeDirA)
+	sconfA := createConfFile(t, []byte(srvConfA))
+	defer removeFile(t, sconfA)
+	srvA, optsA := RunServerWithConfig(sconfA)
+	defer srvA.Shutdown()
+
+	// Server that has the original as a cluster.
+	srvConfB := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "B"
+
+		ocsp { mode: "always" }
+
+		tls {
+			cert_file: "configs/certs/ocsp/server-status-request-url-01-cert.pem"
+			key_file: "configs/certs/ocsp/server-status-request-url-01-key.pem"
+			ca_file: "configs/certs/ocsp/ca-cert.pem"
+			timeout: 5
+		}
+		store_dir: "%s"
+
+		cluster {
+			name: A
+			host: "127.0.0.1"
+			advertise: 127.0.0.1
+			port: -1
+
+			routes: [ nats://127.0.0.1:%d ]
+
+			tls {
+				cert_file: "configs/certs/ocsp/server-status-request-url-02-cert.pem"
+				key_file: "configs/certs/ocsp/server-status-request-url-02-key.pem"
+				ca_file: "configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+			}
+		}
+
+		gateway {
+			name: A
+			host: "127.0.0.1"
+			advertise: "127.0.0.1"
+			port: -1
+
+			tls {
+				cert_file: "configs/certs/ocsp/server-status-request-url-03-cert.pem"
+				key_file: "configs/certs/ocsp/server-status-request-url-03-key.pem"
+				ca_file: "configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+				verify: true
+			}
+		}
+	`
+	srvConfB = fmt.Sprintf(srvConfB, storeDirB, optsA.Cluster.Port)
+	conf := createConfFile(t, []byte(srvConfB))
+	defer removeFile(t, conf)
+	srvB, optsB := RunServerWithConfig(conf)
+	defer srvB.Shutdown()
+
+	// Client connects to server A.
+	cA, err := nats.Connect(fmt.Sprintf("tls://127.0.0.1:%d", optsA.Port),
+		nats.Secure(&tls.Config{
+			VerifyConnection: func(s tls.ConnectionState) error {
+				if s.OCSPResponse == nil {
+					return fmt.Errorf("missing OCSP Staple from server")
+				}
+				return nil
+			},
+		}),
+		nats.RootCAs(caCert),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	if err != nil {
+		t.Fatal(err)
+
+	}
+	defer cA.Close()
+
+	// Start another server that will make connect as a gateway to cluster A.
+	srvConfC := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "C"
+
+		ocsp { mode: "always" }
+
+		tls {
+			cert_file: "configs/certs/ocsp/server-status-request-url-05-cert.pem"
+			key_file: "configs/certs/ocsp/server-status-request-url-05-key.pem"
+			ca_file: "configs/certs/ocsp/ca-cert.pem"
+			timeout: 5
+		}
+		store_dir: "%s"
+		gateway {
+			name: C
+			host: "127.0.0.1"
+			advertise: "127.0.0.1"
+			port: -1
+			gateways: [{
+				name: "A", 
+				urls: ["nats://127.0.0.1:%d"]
+				tls {
+					cert_file: "configs/certs/ocsp/server-status-request-url-06-cert.pem"
+					key_file: "configs/certs/ocsp/server-status-request-url-06-key.pem"
+					ca_file: "configs/certs/ocsp/ca-cert.pem"
+					timeout: 5
+				}
+			}]
+			tls {
+				cert_file: "configs/certs/ocsp/server-status-request-url-06-cert.pem"
+				key_file: "configs/certs/ocsp/server-status-request-url-06-key.pem"
+				ca_file: "configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+				verify: true
+			}
+		}
+	`
+	srvConfC = fmt.Sprintf(srvConfC, storeDirC, optsA.Gateway.Port)
+	conf = createConfFile(t, []byte(srvConfC))
+	defer removeFile(t, conf)
+	srvC, optsC := RunServerWithConfig(conf)
+	defer srvC.Shutdown()
+
+	// Check that server is connected to any server from the other cluster.
+	checkClusterFormed(t, srvA, srvB)
+	waitForOutboundGateways(t, srvC, 1, 5*time.Second)
+
+	// Start one more server that will become another gateway.
+	srvConfD := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "D"
+
+		ocsp { mode: "auto", url: "%s" }
+
+		tls {
+			cert_file: "configs/certs/ocsp/server-status-request-url-07-cert.pem"
+			key_file: "configs/certs/ocsp/server-status-request-url-07-key.pem"
+			ca_file: "configs/certs/ocsp/ca-cert.pem"
+			timeout: 5
+		}
+		store_dir: "%s"
+		gateway {
+			name: D
+			host: "127.0.0.1"
+			advertise: "127.0.0.1"
+			port: -1
+			gateways: [{
+				name: "A", 
+				urls: ["nats://127.0.0.1:%d"]
+				tls {
+					cert_file: "configs/certs/ocsp/server-status-request-url-08-cert.pem"
+					key_file: "configs/certs/ocsp/server-status-request-url-08-key.pem"
+					ca_file: "configs/certs/ocsp/ca-cert.pem"
+					timeout: 5
+				}},
+				{
+				name: "C", 
+				urls: ["nats://127.0.0.1:%d"]
+
+				####################################################################
+				## TEST NOTE: This cert does not have an OCSP Staple intentionally##
+				####################################################################
+				tls {
+					ca_file: "configs/certs/ocsp/ca-cert.pem"
+					cert_file: "configs/certs/ocsp/server-cert.pem"
+					key_file: "configs/certs/ocsp/server-key.pem"
+					timeout: 5
+				}}
+			]
+			tls {
+				cert_file: "configs/certs/ocsp/server-status-request-url-08-cert.pem"
+				key_file: "configs/certs/ocsp/server-status-request-url-08-key.pem"
+				ca_file: "configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+				verify: true
+			}
+		}
+	`
+	srvConfD = fmt.Sprintf(srvConfD, addr, storeDirD, optsA.Gateway.Port, optsC.Gateway.Port)
+	conf = createConfFile(t, []byte(srvConfD))
+	defer removeFile(t, conf)
+	srvD, _ := RunServerWithConfig(conf)
+	defer srvD.Shutdown()
+
+	// There should be a single gateway here because one of the gateway connections does not have a OCSP staple.
+	waitForOutboundGateways(t, srvD, 1, 10*time.Second)
+
+	// Connect to cluster A using server B.
+	cB, err := nats.Connect(fmt.Sprintf("tls://127.0.0.1:%d", optsB.Port),
+		nats.Secure(&tls.Config{
+			VerifyConnection: func(s tls.ConnectionState) error {
+				if s.OCSPResponse == nil {
+					return fmt.Errorf("missing OCSP Staple from server")
+				}
+				return nil
+			},
+		}),
+		nats.RootCAs(caCert),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cB.Close()
+
+	// Connects to cluster C using server C.
+	cC, err := nats.Connect(fmt.Sprintf("tls://127.0.0.1:%d", optsC.Port),
+		nats.Secure(&tls.Config{
+			VerifyConnection: func(s tls.ConnectionState) error {
+				if s.OCSPResponse == nil {
+					return fmt.Errorf("missing OCSP Staple from server")
+				}
+				return nil
+			},
+		}),
+		nats.RootCAs(caCert),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cC.Close()
+
+	_, err = cA.Subscribe("foo", func(m *nats.Msg) {
+		m.Respond([]byte("From Server A"))
+	})
+	if err != nil {
+		t.Errorf("%v", err)
+	}
+	cA.Flush()
+
+	_, err = cB.Subscribe("bar", func(m *nats.Msg) {
+		m.Respond([]byte("From Server B"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cB.Flush()
+
+	// Confirm that a message from server C can flow back to server A via gateway..
+	var (
+		resp *nats.Msg
+		lerr error
+	)
+	for i := 0; i < 10; i++ {
+		resp, lerr = cC.Request("foo", nil, 500*time.Millisecond)
+		if lerr != nil {
+			continue
+		}
+		got := string(resp.Data)
+		expected := "From Server A"
+		if got != expected {
+			t.Fatalf("Expected %v, got: %v", expected, got)
+		}
+
+		// Make request to B
+		resp, lerr = cC.Request("bar", nil, 500*time.Millisecond)
+		if lerr != nil {
+			continue
+		}
+		got = string(resp.Data)
+		expected = "From Server B"
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+		lerr = nil
+		break
+	}
+	if lerr != nil {
+		t.Errorf("Unexpected error: %v", lerr)
+	}
+	if n := srvD.NumOutboundGateways(); n > 1 {
+		t.Errorf("Expected single gateway, got: %v", n)
+	}
 }

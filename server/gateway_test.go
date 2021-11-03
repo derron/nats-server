@@ -2946,7 +2946,7 @@ type checkErrorLogger struct {
 func (l *checkErrorLogger) Errorf(format string, args ...interface{}) {
 	l.DummyLogger.Errorf(format, args...)
 	l.Lock()
-	if strings.Contains(l.msg, l.checkErrorStr) {
+	if strings.Contains(l.Msg, l.checkErrorStr) {
 		l.gotError = true
 	}
 	l.Unlock()
@@ -6455,4 +6455,165 @@ func TestGatewayAuthDiscovered(t *testing.T) {
 	waitForOutboundGateways(t, srvA, 1, time.Second)
 	waitForInboundGateways(t, srvB, 1, time.Second)
 	waitForOutboundGateways(t, srvB, 1, time.Second)
+}
+
+func TestTLSGatewaysCertificateImplicitAllowPass(t *testing.T) {
+	testTLSGatewaysCertificateImplicitAllow(t, true)
+}
+
+func TestTLSGatewaysCertificateImplicitAllowFail(t *testing.T) {
+	testTLSGatewaysCertificateImplicitAllow(t, false)
+}
+
+func testTLSGatewaysCertificateImplicitAllow(t *testing.T, pass bool) {
+	// Base config for the servers
+	cfg := createFile(t, "cfg")
+	defer removeFile(t, cfg.Name())
+	cfg.WriteString(fmt.Sprintf(`
+		gateway {
+		  tls {
+			cert_file = "../test/configs/certs/tlsauth/server.pem"
+			key_file = "../test/configs/certs/tlsauth/server-key.pem"
+			ca_file = "../test/configs/certs/tlsauth/ca.pem"
+			verify_cert_and_check_known_urls = true
+			insecure = %t
+			timeout = 1
+		  }
+		}
+	`, !pass)) // set insecure to skip verification on the outgoing end
+	if err := cfg.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	optsA := LoadConfig(cfg.Name())
+	optsB := LoadConfig(cfg.Name())
+
+	urlA := "nats://localhost:9995"
+	urlB := "nats://localhost:9996"
+	if !pass {
+		urlA = "nats://127.0.0.1:9995"
+		urlB = "nats://127.0.0.1:9996"
+	}
+
+	gwA, err := url.Parse(urlA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwB, err := url.Parse(urlB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	optsA.Host = "127.0.0.1"
+	optsA.Port = -1
+	optsA.Gateway.Name = "A"
+	optsA.Gateway.Port = 9995
+	optsA.Gateway.resolver = &localhostResolver{}
+
+	optsB.Host = "127.0.0.1"
+	optsB.Port = -1
+	optsB.Gateway.Name = "B"
+	optsB.Gateway.Port = 9996
+	optsB.Gateway.resolver = &localhostResolver{}
+
+	gateways := make([]*RemoteGatewayOpts, 2)
+	gateways[0] = &RemoteGatewayOpts{
+		Name: optsA.Gateway.Name,
+		URLs: []*url.URL{gwA},
+	}
+	gateways[1] = &RemoteGatewayOpts{
+		Name: optsB.Gateway.Name,
+		URLs: []*url.URL{gwB},
+	}
+
+	optsA.Gateway.Gateways = gateways
+	optsB.Gateway.Gateways = gateways
+
+	SetGatewaysSolicitDelay(100 * time.Millisecond)
+	defer ResetGatewaysSolicitDelay()
+
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	if pass {
+		waitForOutboundGateways(t, srvA, 1, 5*time.Second)
+		waitForOutboundGateways(t, srvB, 1, 5*time.Second)
+	} else {
+		time.Sleep(1 * time.Second) // the fail case uses the IP, so a short wait is sufficient
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if srvA.NumOutboundGateways() != 0 || srvB.NumOutboundGateways() != 0 {
+				return fmt.Errorf("No outbound gateway connection expected")
+			}
+			return nil
+		})
+	}
+}
+
+func TestGatewayURLsNotRemovedOnDuplicateRoute(t *testing.T) {
+	// For this test, we need to have servers in cluster B creating routes
+	// to each other to help produce the "duplicate route" situation, so
+	// we are forced to use deterministic ports.
+	getEphemeralPort := func() int {
+		t.Helper()
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Error getting a port: %v", err)
+		}
+		p := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		return p
+	}
+	p1 := getEphemeralPort()
+	p2 := getEphemeralPort()
+	routeURLs := fmt.Sprintf("nats://127.0.0.1:%d,nats://127.0.0.1:%d", p1, p2)
+
+	ob1 := testDefaultOptionsForGateway("B")
+	ob1.Cluster.Port = p1
+	ob1.Routes = RoutesFromStr(routeURLs)
+	sb1 := RunServer(ob1)
+	defer sb1.Shutdown()
+
+	ob2 := testDefaultOptionsForGateway("B")
+	ob2.Cluster.Port = p2
+	ob2.Routes = RoutesFromStr(routeURLs)
+	sb2 := RunServer(ob2)
+	defer sb2.Shutdown()
+
+	checkClusterFormed(t, sb1, sb2)
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb1)
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sb1, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb2, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 2, 2*time.Second)
+
+	checkURLs := func(s *Server) {
+		t.Helper()
+		s.mu.Lock()
+		urls := s.gateway.URLs.getAsStringSlice()
+		s.mu.Unlock()
+		if len(urls) != 2 {
+			t.Fatalf("Expected 2 urls, got %v", urls)
+		}
+	}
+	checkURLs(sb1)
+	checkURLs(sb2)
+
+	// As for sa, we should have both sb1 and sb2 urls in its outbound urls map
+	c := sa.getOutboundGatewayConnection("B")
+	if c == nil {
+		t.Fatal("No outound connection found!")
+	}
+	c.mu.Lock()
+	urls := c.gw.cfg.urls
+	c.mu.Unlock()
+	if len(urls) != 2 {
+		t.Fatalf("Expected 2 urls to B, got %v", urls)
+	}
 }

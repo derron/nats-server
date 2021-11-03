@@ -16,6 +16,8 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -566,7 +568,7 @@ func TestFileStoreBytesLimit(t *testing.T) {
 }
 
 func TestFileStoreAgeLimit(t *testing.T) {
-	maxAge := 100 * time.Millisecond
+	maxAge := 250 * time.Millisecond
 
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
@@ -584,7 +586,9 @@ func TestFileStoreAgeLimit(t *testing.T) {
 	subj, msg := "foo", []byte("Hello World")
 	toStore := 500
 	for i := 0; i < toStore; i++ {
-		fs.StoreMsg(subj, nil, msg)
+		if _, _, err := fs.StoreMsg(subj, nil, msg); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
 	}
 	state := fs.State()
 	if state.Msgs != uint64(toStore) {
@@ -614,7 +618,16 @@ func TestFileStoreAgeLimit(t *testing.T) {
 	if state.Msgs != uint64(toStore) {
 		t.Fatalf("Expected %d msgs, got %d", toStore, state.Msgs)
 	}
+	fs.RemoveMsg(502)
+	fs.RemoveMsg(602)
+	fs.RemoveMsg(702)
+	fs.RemoveMsg(802)
+	// We will measure the time to make sure expires works with interior deletes.
+	start := time.Now()
 	checkExpired(t)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Took too long to expire: %v", elapsed)
+	}
 }
 
 func TestFileStoreTimeStamps(t *testing.T) {
@@ -1783,12 +1796,11 @@ func TestFileStoreSnapshot(t *testing.T) {
 		// Will have more exhaustive tests in jetstream_test.go.
 		state.Consumers = 0
 
-		// FIXME(dlc) - Also the hashes will not match if directory is not the same, so need to
-		// work through that problem too. The test below will pass but if you try to extract a
-		// message that will most likely fail.
+		// Just check the state.
 		if !reflect.DeepEqual(rstate, state) {
 			t.Fatalf("Restored state does not match:\n%+v\n\n%+v", rstate, state)
 		}
+
 	}
 
 	// Simple case first.
@@ -1810,6 +1822,21 @@ func TestFileStoreSnapshot(t *testing.T) {
 		seq := uint64(rand.Int63n(total) + 101)
 		fs.RemoveMsg(seq)
 	}
+
+	snap = snapshot()
+	verifySnapshot(snap)
+
+	// Make sure compaction works with snapshots.
+	fs.mu.RLock()
+	for _, mb := range fs.blks {
+		// Should not call compact on last msg block.
+		if mb != fs.lmb {
+			mb.mu.Lock()
+			mb.compact()
+			mb.mu.Unlock()
+		}
+	}
+	fs.mu.RUnlock()
 
 	snap = snapshot()
 	verifySnapshot(snap)
@@ -1965,6 +1992,26 @@ func TestFileStoreConsumer(t *testing.T) {
 	updateAndCheck()
 }
 
+func TestFileStoreConsumerEncodeDecodeRedelivered(t *testing.T) {
+	state := &ConsumerState{}
+
+	state.Delivered.Consumer = 100
+	state.Delivered.Stream = 100
+	state.AckFloor.Consumer = 50
+	state.AckFloor.Stream = 50
+
+	state.Redelivered = map[uint64]uint64{122: 3, 144: 8}
+	buf := encodeConsumerState(state)
+
+	rstate, err := decodeConsumerState(buf)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(state, rstate) {
+		t.Fatalf("States do not match: %+v vs %+v", state, rstate)
+	}
+}
+
 func TestFileStoreWriteFailures(t *testing.T) {
 	// This test should be run inside an environment where this directory
 	// has a limited size.
@@ -2077,7 +2124,7 @@ func TestFileStorePerf(t *testing.T) {
 	defer removeDir(t, storeDir)
 
 	fs, err := newFileStore(
-		FileStoreConfig{StoreDir: storeDir},
+		FileStoreConfig{StoreDir: storeDir, AsyncFlush: true},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
 	if err != nil {
@@ -2359,6 +2406,7 @@ func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
 	restartConsumer := func() {
 		t.Helper()
 		o.Stop()
+		time.Sleep(20 * time.Millisecond) // Wait for all things to settle.
 		o, err = fs.ConsumerStore("o22", cfg)
 		if err != nil {
 			t.Fatalf("Unexepected error: %v", err)
@@ -2367,6 +2415,9 @@ func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
 		state, err := o.State()
 		if err != nil {
 			t.Fatalf("Unexepected error: %v", err)
+		}
+		if state == nil {
+			t.Fatalf("Did not recover state")
 		}
 		if len(state.Redelivered) == 0 {
 			t.Fatalf("Did not recover redelivered")
@@ -2661,6 +2712,41 @@ func TestFileStoreStreamStateDeleted(t *testing.T) {
 	}
 }
 
+// We have reports that sometimes under load a stream could complain about a storage directory
+// not being empty.
+func TestFileStoreStreamDeleteDirNotEmpty(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, toStore := "foo", uint64(10)
+	for i := uint64(1); i <= toStore; i++ {
+		msg := []byte(fmt.Sprintf("[%08d] Hello World!", i))
+		if _, _, err := fs.StoreMsg(subj, nil, msg); err != nil {
+			t.Fatalf("Error storing msg: %v", err)
+		}
+	}
+
+	ready := make(chan bool)
+	go func() {
+		g := path.Join(storeDir, "g")
+		ready <- true
+		for i := 0; i < 100; i++ {
+			ioutil.WriteFile(g, []byte("OK"), defaultFilePerms)
+		}
+	}()
+
+	<-ready
+	if err := fs.Delete(); err != nil {
+		t.Fatalf("Delete returned an error: %v", err)
+	}
+}
+
 func TestFileStoreConsumerPerf(t *testing.T) {
 	// Comment out to run, holding place for now.
 	t.SkipNow()
@@ -2886,5 +2972,442 @@ func TestBadConsumerState(t *testing.T) {
 	bs := []byte("\x16\x02\x01\x01\x03\x02\x01\x98\xf4\x8a\x8a\f\x01\x03\x86\xfa\n\x01\x00\x01")
 	if cs, err := decodeConsumerState(bs); err != nil || cs == nil {
 		t.Fatalf("Expected to not throw error, got %v and %+v", err, cs)
+	}
+}
+
+func TestFileStoreExpireMsgsOnStart(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	ttl := 250 * time.Millisecond
+	cfg := StreamConfig{Name: "ORDERS", Subjects: []string{"orders.*"}, Storage: FileStorage, MaxAge: ttl}
+	var fs *fileStore
+
+	startFS := func() *fileStore {
+		t.Helper()
+		fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 8 * 1024}, cfg)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		return fs
+	}
+
+	newFS := func() *fileStore {
+		t.Helper()
+		if fs != nil {
+			fs.Stop()
+			fs = nil
+		}
+		removeDir(t, storeDir)
+		return startFS()
+	}
+
+	restartFS := func(delay time.Duration) *fileStore {
+		if fs != nil {
+			fs.Stop()
+			fs = nil
+			time.Sleep(delay)
+		}
+		fs = startFS()
+		return fs
+	}
+
+	fs = newFS()
+	defer fs.Stop()
+
+	msg := bytes.Repeat([]byte("ABC"), 33) // ~100bytes
+	loadMsgs := func(n int) {
+		t.Helper()
+		for i := 1; i <= n; i++ {
+			if _, _, err := fs.StoreMsg(fmt.Sprintf("orders.%d", i%10), nil, msg); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		}
+	}
+
+	checkState := func(msgs, first, last uint64) {
+		t.Helper()
+		if fs == nil {
+			t.Fatalf("No fs")
+			return
+		}
+		state := fs.State()
+		if state.Msgs != msgs {
+			t.Fatalf("Expected %d msgs, got %d", msgs, state.Msgs)
+		}
+		if state.FirstSeq != first {
+			t.Fatalf("Expected %d as first, got %d", first, state.FirstSeq)
+		}
+		if state.LastSeq != last {
+			t.Fatalf("Expected %d as last, got %d", last, state.LastSeq)
+		}
+	}
+
+	checkNumBlks := func(expected int) {
+		fs.mu.RLock()
+		n := len(fs.blks)
+		fs.mu.RUnlock()
+		if n != expected {
+			t.Fatalf("Expected %d msg blks, got %d", expected, n)
+		}
+	}
+
+	// Check the filtered subject state and make sure that is tracked properly.
+	checkFiltered := func(subject string, ss SimpleState) {
+		t.Helper()
+		fss := fs.FilteredState(1, subject)
+		if fss != ss {
+			t.Fatalf("Expected FilteredState of %+v, got %+v", ss, fss)
+		}
+	}
+
+	// Make sure state on disk matches (e.g. writeIndexInfo properly called)
+	checkBlkState := func(index int) {
+		t.Helper()
+		fs.mu.RLock()
+		if index >= len(fs.blks) {
+			t.Fatalf("Out of range, wanted %d but only %d blks", index, len(fs.blks))
+		}
+		mb := fs.blks[index]
+		fs.mu.RUnlock()
+
+		var errStr string
+
+		mb.mu.RLock()
+		// We will do a readIndex op on our clone and then compare.
+		mbc := &msgBlock{fs: fs, ifn: mb.ifn}
+		if err := mbc.readIndexInfo(); err != nil {
+			mb.mu.RUnlock()
+			t.Fatalf("Error during readIndexInfo: %v", err)
+		}
+		// Check state as represented by index info.
+		if mb.msgs != mbc.msgs {
+			errStr = fmt.Sprintf("msgs do not match: %d vs %d", mb.msgs, mbc.msgs)
+		} else if mb.bytes != mbc.bytes {
+			errStr = fmt.Sprintf("bytes do not match: %d vs %d", mb.bytes, mbc.bytes)
+		} else if mb.first != mbc.first {
+			errStr = fmt.Sprintf("first state does not match: %d vs %d", mb.first, mbc.first)
+		} else if mb.last != mbc.last {
+			errStr = fmt.Sprintf("last state does not match: %d vs %d", mb.last, mbc.last)
+		} else if !reflect.DeepEqual(mb.dmap, mbc.dmap) {
+			errStr = fmt.Sprintf("deleted map does not match: %d vs %d", mb.dmap, mbc.dmap)
+		}
+		mb.mu.RUnlock()
+		if errStr != _EMPTY_ {
+			t.Fatal(errStr)
+		}
+	}
+
+	lastSeqForBlk := func(index int) uint64 {
+		t.Helper()
+		fs.mu.RLock()
+		defer fs.mu.RUnlock()
+		if len(fs.blks) == 0 {
+			t.Fatalf("No blocks?")
+		}
+		mb := fs.blks[0]
+		mb.mu.RLock()
+		defer mb.mu.RUnlock()
+		return mb.last.seq
+	}
+
+	// Actual testing here.
+
+	loadMsgs(500)
+	restartFS(ttl + 100*time.Millisecond)
+	checkState(0, 501, 500)
+	checkNumBlks(0)
+
+	// Now check partial expires and the fss tracking state.
+	// Small numbers is to keep them in one block.
+	fs = newFS()
+	loadMsgs(10)
+	time.Sleep(100 * time.Millisecond)
+	loadMsgs(10)
+	restartFS(ttl - 100*time.Millisecond + 25*time.Millisecond) // Just want half
+	checkState(10, 11, 20)
+	checkNumBlks(1)
+	checkFiltered("orders.*", SimpleState{Msgs: 10, First: 11, Last: 20})
+	checkFiltered("orders.5", SimpleState{Msgs: 1, First: 15, Last: 15})
+	checkBlkState(0)
+
+	fs = newFS()
+	loadMsgs(5)
+	time.Sleep(100 * time.Millisecond)
+	loadMsgs(15)
+	restartFS(ttl - 100*time.Millisecond + 25*time.Millisecond) // Just want half
+	checkState(15, 6, 20)
+	checkFiltered("orders.*", SimpleState{Msgs: 15, First: 6, Last: 20})
+	checkFiltered("orders.5", SimpleState{Msgs: 2, First: 10, Last: 20})
+
+	// Now we want to test that if the end of a msg block is all deletes msgs that we do the right thing.
+	fs = newFS()
+	loadMsgs(150)
+	time.Sleep(100 * time.Millisecond)
+	loadMsgs(100)
+
+	checkNumBlks(5)
+
+	// Now delete 10 messages from the end of the first block which we will expire on restart.
+	// We will expire up to seq 100, so delete 91-100.
+	lseq := lastSeqForBlk(0)
+	for seq := lseq; seq > lseq-10; seq-- {
+		removed, err := fs.RemoveMsg(seq)
+		if err != nil || !removed {
+			t.Fatalf("Error removing message: %v", err)
+		}
+	}
+	restartFS(ttl - 100*time.Millisecond + 25*time.Millisecond) // Just want half
+	checkState(100, 151, 250)
+	checkNumBlks(3) // We should only have 3 blks left.
+	checkBlkState(0)
+
+	// Now make sure that we properly clean up any internal dmap entries (sparse) when expiring.
+	fs = newFS()
+	loadMsgs(10)
+	// Remove some in sparse fashion, adding to dmap.
+	fs.RemoveMsg(2)
+	fs.RemoveMsg(4)
+	fs.RemoveMsg(6)
+	time.Sleep(100 * time.Millisecond)
+	loadMsgs(10)
+	restartFS(ttl - 100*time.Millisecond + 25*time.Millisecond) // Just want half
+	checkState(10, 11, 20)
+	checkNumBlks(1)
+	checkBlkState(0)
+
+	// Make sure expiring a block with tail deleted messages removes the message block etc.
+	fs = newFS()
+	loadMsgs(7)
+	time.Sleep(100 * time.Millisecond)
+	loadMsgs(3)
+	fs.RemoveMsg(8)
+	fs.RemoveMsg(9)
+	fs.RemoveMsg(10)
+	restartFS(ttl - 100*time.Millisecond + 25*time.Millisecond)
+	checkState(0, 11, 10)
+
+	// Not for start per se but since we have all the test tooling here check that Compact() does right thing as well.
+	fs = newFS()
+	loadMsgs(100)
+	checkFiltered("orders.*", SimpleState{Msgs: 100, First: 1, Last: 100})
+	checkFiltered("orders.5", SimpleState{Msgs: 10, First: 5, Last: 95})
+	// Check that Compact keeps fss updated, does dmap etc.
+	fs.Compact(51)
+	checkFiltered("orders.*", SimpleState{Msgs: 50, First: 51, Last: 100})
+	checkFiltered("orders.5", SimpleState{Msgs: 5, First: 55, Last: 95})
+	checkBlkState(0)
+}
+
+func TestFileStoreSparseCompaction(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	cfg := StreamConfig{Name: "KV", Subjects: []string{"kv.>"}, Storage: FileStorage}
+	var fs *fileStore
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 1024 * 1024}, cfg)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	msg := bytes.Repeat([]byte("ABC"), 33) // ~100bytes
+	loadMsgs := func(n int) {
+		t.Helper()
+		for i := 1; i <= n; i++ {
+			if _, _, err := fs.StoreMsg(fmt.Sprintf("kv.%d", i%10), nil, msg); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		}
+	}
+
+	checkState := func(msgs, first, last uint64) {
+		t.Helper()
+		if fs == nil {
+			t.Fatalf("No fs")
+			return
+		}
+		state := fs.State()
+		if state.Msgs != msgs {
+			t.Fatalf("Expected %d msgs, got %d", msgs, state.Msgs)
+		}
+		if state.FirstSeq != first {
+			t.Fatalf("Expected %d as first, got %d", first, state.FirstSeq)
+		}
+		if state.LastSeq != last {
+			t.Fatalf("Expected %d as last, got %d", last, state.LastSeq)
+		}
+	}
+
+	deleteMsgs := func(seqs ...uint64) {
+		t.Helper()
+		for _, seq := range seqs {
+			removed, err := fs.RemoveMsg(seq)
+			if err != nil || !removed {
+				t.Fatalf("Got an error on remove of %d: %v", seq, err)
+			}
+		}
+	}
+
+	eraseMsgs := func(seqs ...uint64) {
+		t.Helper()
+		for _, seq := range seqs {
+			removed, err := fs.EraseMsg(seq)
+			if err != nil || !removed {
+				t.Fatalf("Got an error on erase of %d: %v", seq, err)
+			}
+		}
+	}
+
+	compact := func() {
+		t.Helper()
+		var ssb, ssa StreamState
+		fs.FastState(&ssb)
+		tb, ub, _ := fs.Utilization()
+
+		fs.mu.RLock()
+		if len(fs.blks) == 0 {
+			t.Fatalf("No blocks?")
+		}
+		mb := fs.blks[0]
+		fs.mu.RUnlock()
+
+		mb.mu.Lock()
+		mb.compact()
+		mb.mu.Unlock()
+		fs.FastState(&ssa)
+		if !reflect.DeepEqual(ssb, ssa) {
+			t.Fatalf("States do not match; %+v vs %+v", ssb, ssa)
+		}
+		ta, ua, _ := fs.Utilization()
+		if ub != ua {
+			t.Fatalf("Expected used to be the same, got %d vs %d", ub, ua)
+		}
+		if ta >= tb {
+			t.Fatalf("Expected total after to be less then before, got %d vs %d", tb, ta)
+		}
+	}
+
+	// Actual testing here.
+	loadMsgs(1000)
+	checkState(1000, 1, 1000)
+
+	// Now delete a few messages.
+	deleteMsgs(1)
+	compact()
+
+	deleteMsgs(1000, 999, 998, 997)
+	compact()
+
+	eraseMsgs(500, 502, 504, 506, 508, 510)
+	compact()
+
+	// Now test encrypted mode.
+	fs.Delete()
+
+	prf := func(context []byte) ([]byte, error) {
+		h := hmac.New(sha256.New, []byte("dlc22"))
+		if _, err := h.Write(context); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+
+	fs, err = newFileStoreWithCreated(FileStoreConfig{StoreDir: storeDir, BlockSize: 1024 * 1024}, cfg, time.Now(), prf)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	loadMsgs(1000)
+	checkState(1000, 1, 1000)
+
+	// Now delete a few messages.
+	deleteMsgs(1)
+	compact()
+
+	deleteMsgs(1000, 999, 998, 997)
+	compact()
+
+	eraseMsgs(500, 502, 504, 506, 508, 510)
+	compact()
+}
+
+func TestFileStoreSparseCompactionWithInteriorDeletes(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	cfg := StreamConfig{Name: "KV", Subjects: []string{"kv.>"}, Storage: FileStorage}
+	var fs *fileStore
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, cfg)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	for i := 1; i <= 1000; i++ {
+		if _, _, err := fs.StoreMsg(fmt.Sprintf("kv.%d", i%10), nil, []byte("OK")); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	// Now do interior deletes.
+	for _, seq := range []uint64{500, 600, 700, 800} {
+		removed, err := fs.RemoveMsg(seq)
+		if err != nil || !removed {
+			t.Fatalf("Got an error on remove of %d: %v", seq, err)
+		}
+	}
+
+	_, _, _, _, err = fs.LoadMsg(900)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Do compact by hand, make sure we can still access msgs past the interior deletes.
+	fs.mu.RLock()
+	lmb := fs.lmb
+	lmb.dirtyCloseWithRemove(false)
+	lmb.compact()
+	fs.mu.RUnlock()
+
+	_, _, _, _, err = fs.LoadMsg(900)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+// When messages span multiple blocks and we want to purge but keep some amount, say 1, we would remove all.
+// This is because we would not break out of iterator across more message blocks.
+// Issue #2622
+func TestFileStorePurgeExKeepOneBug(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 128}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	fill := bytes.Repeat([]byte("X"), 128)
+
+	fs.StoreMsg("A", nil, []byte("META"))
+	fs.StoreMsg("B", nil, fill)
+	fs.StoreMsg("A", nil, []byte("META"))
+	fs.StoreMsg("B", nil, fill)
+
+	if fss := fs.FilteredState(1, "A"); fss.Msgs != 2 {
+		t.Fatalf("Expected to find 2 `A` msgs, got %d", fss.Msgs)
+	}
+
+	n, err := fs.PurgeEx("A", 0, 1)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Expected PurgeEx to remove 1 `A` msgs, got %d", n)
+	}
+	if fss := fs.FilteredState(1, "A"); fss.Msgs != 1 {
+		t.Fatalf("Expected to find 1 `A` msgs, got %d", fss.Msgs)
 	}
 }
