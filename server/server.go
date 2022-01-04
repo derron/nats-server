@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -1546,6 +1547,11 @@ func (s *Server) Start() {
 	s.grRunning = true
 	s.grMu.Unlock()
 
+	// Pprof http endpoint for the profiler.
+	if opts.ProfPort != 0 {
+		s.StartProfiler()
+	}
+
 	if opts.ConfigFile != _EMPTY_ {
 		s.Noticef("Using configuration file: %s", opts.ConfigFile)
 	}
@@ -1743,11 +1749,6 @@ func (s *Server) Start() {
 		s.startGoRoutine(func() {
 			s.StartRouting(clientListenReady)
 		})
-	}
-
-	// Pprof http endpoint for the profiler.
-	if opts.ProfPort != 0 {
-		s.StartProfiler()
 	}
 
 	if opts.PortsFileDir != _EMPTY_ {
@@ -2183,6 +2184,36 @@ func (s *Server) basePath(p string) string {
 	return path.Join(s.httpBasePath, p)
 }
 
+type captureHTTPServerLog struct {
+	s      *Server
+	prefix string
+}
+
+func (cl *captureHTTPServerLog) Write(p []byte) (int, error) {
+	var buf [128]byte
+	var b = buf[:0]
+
+	b = append(b, []byte(cl.prefix)...)
+	offset := 0
+	if bytes.HasPrefix(p, []byte("http:")) {
+		offset = 6
+	}
+	b = append(b, p[offset:]...)
+	cl.s.Errorf(string(b))
+	return len(p), nil
+}
+
+// The TLS configuration is passed to the listener when the monitoring
+// "server" is setup. That prevents TLS configuration updates on reload
+// from being used. By setting this function in tls.Config.GetConfigForClient
+// we instruct the TLS handshake to ask for the tls configuration to be
+// used for a specific client. We don't care which client, we always use
+// the same TLS configuration.
+func (s *Server) getTLSConfig(_ *tls.ClientHelloInfo) (*tls.Config, error) {
+	opts := s.getOpts()
+	return opts.TLSConfig, nil
+}
+
 // Start the monitoring server
 func (s *Server) startMonitoring(secure bool) error {
 	// Snapshot server options.
@@ -2205,6 +2236,7 @@ func (s *Server) startMonitoring(secure bool) error {
 		}
 		hp = net.JoinHostPort(opts.HTTPHost, strconv.Itoa(port))
 		config := opts.TLSConfig.Clone()
+		config.GetConfigForClient = s.getTLSConfig
 		config.ClientAuth = tls.NoClientCert
 		httpListener, err = tls.Listen("tcp", hp, config)
 
@@ -2255,6 +2287,7 @@ func (s *Server) startMonitoring(secure bool) error {
 		Addr:           hp,
 		Handler:        mux,
 		MaxHeaderBytes: 1 << 20,
+		ErrorLog:       log.New(&captureHTTPServerLog{s, "monitoring: "}, _EMPTY_, 0),
 	}
 	s.mu.Lock()
 	if s.shutdown {

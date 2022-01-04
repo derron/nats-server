@@ -1018,7 +1018,7 @@ func (fs *fileStore) expireMsgsOnRecover() {
 
 	if deleted > 0 {
 		// Update blks slice.
-		fs.blks = append(fs.blks[:0:0], fs.blks[deleted:]...)
+		fs.blks = copyMsgBlocks(fs.blks[deleted:])
 		if lb := len(fs.blks); lb == 0 {
 			fs.lmb = nil
 		} else {
@@ -1028,6 +1028,15 @@ func (fs *fileStore) expireMsgsOnRecover() {
 	// Update top level accounting.
 	fs.state.Msgs -= purged
 	fs.state.Bytes -= bytes
+}
+
+func copyMsgBlocks(src []*msgBlock) []*msgBlock {
+	if src == nil {
+		return nil
+	}
+	dst := make([]*msgBlock, len(src))
+	copy(dst, src)
+	return dst
 }
 
 // GetSeqFromTime looks for the first sequence number that has
@@ -1953,6 +1962,7 @@ func (mb *msgBlock) compact() {
 		}
 		// Always set last.
 		mb.last.seq = seq &^ ebit
+
 		// Advance to next record.
 		index += rl
 	}
@@ -2605,7 +2615,7 @@ func (mb *msgBlock) writeMsgRecord(rl, seq uint64, subj string, mhdr, msg []byte
 	writeIndex := ts-mb.lwits > int64(2*time.Second)
 
 	// Accounting
-	mb.updateAccounting(seq, ts, rl)
+	mb.updateAccounting(seq&^ebit, ts, rl)
 
 	// Check if we are tracking per subject for our simple state.
 	if len(subj) > 0 && mb.fss != nil {
@@ -3366,13 +3376,19 @@ func (fs *fileStore) Type() StorageType {
 }
 
 // FastState will fill in state with only the following.
-// Msgs, Bytes, FirstSeq, LastSeq
+// Msgs, Bytes, First and Last Sequence and Time and NumDeleted.
 func (fs *fileStore) FastState(state *StreamState) {
 	fs.mu.RLock()
 	state.Msgs = fs.state.Msgs
 	state.Bytes = fs.state.Bytes
 	state.FirstSeq = fs.state.FirstSeq
+	state.FirstTime = fs.state.FirstTime
 	state.LastSeq = fs.state.LastSeq
+	state.LastTime = fs.state.LastTime
+	if state.LastSeq > state.FirstSeq {
+		state.NumDeleted = int((state.LastSeq - state.FirstSeq) - state.Msgs + 1)
+	}
+	state.Consumers = len(fs.cfs)
 	fs.mu.RUnlock()
 }
 
@@ -3840,6 +3856,7 @@ func (fs *fileStore) purge(fseq uint64) (uint64, error) {
 	}
 	fs.lmb.first.seq = fs.state.FirstSeq
 	fs.lmb.last.seq = fs.state.LastSeq
+
 	fs.lmb.writeIndexInfo()
 
 	cb := fs.scb
@@ -3934,7 +3951,7 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 
 	if deleted > 0 {
 		// Update blks slice.
-		fs.blks = append(fs.blks[:0:0], fs.blks[deleted:]...)
+		fs.blks = copyMsgBlocks(fs.blks[deleted:])
 	}
 
 	// Update top level accounting.
@@ -4060,7 +4077,7 @@ func (fs *fileStore) removeMsgBlock(mb *msgBlock) {
 	for i, omb := range fs.blks {
 		if mb == omb {
 			blks := append(fs.blks[:i], fs.blks[i+1:]...)
-			fs.blks = append(blks[:0:0], blks...)
+			fs.blks = copyMsgBlocks(blks)
 			break
 		}
 	}

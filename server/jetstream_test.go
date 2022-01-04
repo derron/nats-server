@@ -920,16 +920,16 @@ func TestJetStreamAddStreamBadSubjects(t *testing.T) {
 		if err := json.Unmarshal(resp.Data, &scResp); err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
-		e := scResp.Error
-		if e == nil || e.Code != 500 || e.Description != ErrMalformedSubject.Error() {
-			t.Fatalf("Did not get proper error response: %+v", e)
-		}
+
+		require_Error(t, scResp.ToError(), NewJSStreamInvalidConfigError(fmt.Errorf("invalid subject")))
 	}
 
 	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{"foo.bar."}})
 	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{".."}})
 	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{".*"}})
 	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{".>"}})
+	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{" x"}})
+	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{"y "}})
 }
 
 func TestJetStreamMaxConsumers(t *testing.T) {
@@ -11422,7 +11422,7 @@ func TestJetStreamMirrorBasics(t *testing.T) {
 	createStreamOk := func(cfg *nats.StreamConfig) {
 		t.Helper()
 		if _, err := createStream(cfg); err != nil {
-			t.Fatalf("Expected error, got %+v", err)
+			t.Fatalf("Expected no error, got %+v", err)
 		}
 	}
 
@@ -11561,6 +11561,30 @@ func TestJetStreamMirrorBasics(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamMirrorUpdatePreventsSubjects(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "ORIGINAL"})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{Name: "MIRROR", Mirror: &nats.StreamSource{Name: "ORIGINAL"}})
+	require_NoError(t, err)
+
+	_, err = js.UpdateStream(&nats.StreamConfig{Name: "MIRROR", Mirror: &nats.StreamSource{Name: "ORIGINAL"}, Subjects: []string{"x"}})
+	if err == nil || err.Error() != "stream mirrors may not have subjects" {
+		t.Fatalf("Expected to not be able to put subjects on a stream, got: %+v", err)
+	}
 }
 
 func TestJetStreamSourceBasics(t *testing.T) {
@@ -13543,6 +13567,215 @@ func TestJetStreamLargeExpiresAndServerRestart(t *testing.T) {
 
 	if waited := time.Since(start); waited > maxAge+time.Second {
 		t.Fatalf("Waited to long %v vs %v for messages to expire", waited, maxAge)
+	}
+}
+
+// Bug that was reported showing memstore not handling max per subject of 1.
+func TestJetStreamMessagePerSubjectKeepBug(t *testing.T) {
+	test := func(t *testing.T, keep int64, store nats.StorageType) {
+		s := RunBasicJetStreamServer()
+		defer s.Shutdown()
+
+		config := s.JetStreamConfig()
+		if config != nil {
+			defer removeDir(t, config.StoreDir)
+		}
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:              "TEST",
+			MaxMsgsPerSubject: keep,
+			Storage:           store,
+		})
+		require_NoError(t, err)
+
+		for i := 0; i < 100; i++ {
+			_, err = js.Publish("TEST", []byte(fmt.Sprintf("test %d", i)))
+			require_NoError(t, err)
+		}
+
+		nfo, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+
+		if nfo.State.Msgs != uint64(keep) {
+			t.Fatalf("Expected %d message got %d", keep, nfo.State.Msgs)
+		}
+	}
+
+	t.Run("FileStore", func(t *testing.T) {
+		t.Run("Keep 10", func(t *testing.T) { test(t, 10, nats.FileStorage) })
+		t.Run("Keep 1", func(t *testing.T) { test(t, 1, nats.FileStorage) })
+	})
+
+	t.Run("MemStore", func(t *testing.T) {
+		t.Run("Keep 10", func(t *testing.T) { test(t, 10, nats.MemoryStorage) })
+		t.Run("Keep 1", func(t *testing.T) { test(t, 1, nats.MemoryStorage) })
+	})
+}
+
+func TestJetStreamInvalidDeliverSubject(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	config := s.JetStreamConfig()
+	if config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST",
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{DeliverSubject: " x"})
+	require_Error(t, err, NewJSConsumerInvalidDeliverSubjectError())
+}
+
+func TestJetStreamMemoryCorruption(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	errCh := make(chan error, 10)
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) {
+		select {
+		case errCh <- e:
+		default:
+		}
+	})
+
+	// The storage has to be MemoryStorage to show the issue
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "bucket", Storage: nats.MemoryStorage})
+	require_NoError(t, err)
+
+	w1, err := kv.WatchAll()
+	require_NoError(t, err)
+
+	w2, err := kv.WatchAll(nats.MetaOnly())
+	require_NoError(t, err)
+
+	kv.Put("key1", []byte("aaa"))
+	kv.Put("key1", []byte("aab"))
+	kv.Put("key2", []byte("zza"))
+	kv.Put("key2", []byte("zzb"))
+	kv.Delete("key1")
+	kv.Delete("key2")
+	kv.Put("key1", []byte("aac"))
+	kv.Put("key2", []byte("zzc"))
+	kv.Delete("key1")
+	kv.Delete("key2")
+	kv.Purge("key1")
+	kv.Purge("key2")
+
+	checkUpdates := func(updates <-chan nats.KeyValueEntry) {
+		t.Helper()
+		count := 0
+		for {
+			select {
+			case <-updates:
+				count++
+				if count == 13 {
+					return
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Did not receive all updates")
+			}
+		}
+	}
+	checkUpdates(w1.Updates())
+	checkUpdates(w2.Updates())
+
+	select {
+	case e := <-errCh:
+		t.Fatal(e)
+	case <-time.After(250 * time.Millisecond):
+		// OK
+	}
+}
+
+func TestJetStreamRecoverBadStreamSubjects(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	config := s.JetStreamConfig()
+	if config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	sd := config.StoreDir
+	s.Shutdown()
+
+	f := path.Join(sd, "$G", "streams", "TEST")
+	fs, err := newFileStore(FileStoreConfig{StoreDir: f}, StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar", " baz "}, // baz has spaces
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+	fs.Stop()
+
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	if len(si.Config.Subjects) != 3 {
+		t.Fatalf("Expected to recover all subjects")
+	}
+}
+
+func TestJetStreamRecoverBadMirrorConfigWithSubjects(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	config := s.JetStreamConfig()
+	if config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	sd := config.StoreDir
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Origin
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "S",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	s.Shutdown()
+
+	f := path.Join(sd, "$G", "streams", "M")
+	fs, err := newFileStore(FileStoreConfig{StoreDir: f}, StreamConfig{
+		Name:     "M",
+		Subjects: []string{"foo", "bar", "baz"}, // Mirrors should not have spaces.
+		Mirror:   &StreamSource{Name: "S"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+	fs.Stop()
+
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	si, err := js.StreamInfo("M")
+	require_NoError(t, err)
+
+	if len(si.Config.Subjects) != 0 {
+		t.Fatalf("Expected to have NO subjects on mirror")
 	}
 }
 

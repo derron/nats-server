@@ -270,7 +270,8 @@ type ApiResponse struct {
 	Error *ApiError `json:"error,omitempty"`
 }
 
-// ToError checks if the response has a error and if it does converts it to an error avoiding the pitfalls described by https://yourbasic.org/golang/gotcha-why-nil-error-not-equal-nil/
+// ToError checks if the response has a error and if it does converts it to an error avoiding
+// the pitfalls described by https://yourbasic.org/golang/gotcha-why-nil-error-not-equal-nil/
 func (r *ApiResponse) ToError() error {
 	if r.Error == nil {
 		return nil
@@ -349,6 +350,12 @@ type JSApiStreamNamesResponse struct {
 }
 
 const JSApiStreamNamesResponseType = "io.nats.jetstream.api.v1.stream_names_response"
+
+type JSApiStreamListRequest struct {
+	ApiPagedRequest
+	// These are filters that can be applied to the list.
+	Subject string `json:"subject,omitempty"`
+}
 
 // JSApiStreamListResponse list of detailed stream information.
 // A nil request is valid and means all streams.
@@ -607,13 +614,17 @@ const defaultMaxJSApiOut = int64(4096)
 var maxJSApiOut = defaultMaxJSApiOut
 
 func (js *jetStream) apiDispatch(sub *subscription, c *client, acc *Account, subject, reply string, rmsg []byte) {
-	hdr, _ := c.msgParts(rmsg)
-	if len(getHeader(ClientInfoHdr, hdr)) == 0 {
-		return
-	}
 	js.mu.RLock()
 	s, rr := js.srv, js.apiSubs.Match(subject)
 	js.mu.RUnlock()
+
+	hdr, _ := c.msgParts(rmsg)
+	if len(getHeader(ClientInfoHdr, hdr)) == 0 {
+		// Check if this is the system account. We will let these through for the account info only.
+		if s.SystemAccount() != acc || subject != JSApiAccountInfo {
+			return
+		}
+	}
 
 	// Shortcircuit.
 	if len(rr.psubs)+len(rr.qsubs) == 0 {
@@ -656,7 +667,7 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, acc *Account, sub
 	// the header from the msg body. No other references are needed.
 	// FIXME(dlc) - Should cleanup eventually and make sending
 	// and receiving internal messages more formal.
-	rmsg = append(rmsg[:0:0], rmsg...)
+	rmsg = copyBytes(rmsg)
 	client := &client{srv: s, kind: JETSTREAM}
 	client.pa = c.pa
 
@@ -1536,27 +1547,38 @@ func (s *Server) jsStreamListRequest(sub *subscription, c *client, _ *Account, s
 	}
 
 	var offset int
+	var filter string
+
 	if !isEmptyRequest(msg) {
-		var req JSApiStreamNamesRequest
+		var req JSApiStreamListRequest
 		if err := json.Unmarshal(msg, &req); err != nil {
 			resp.Error = NewJSInvalidJSONError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
 		offset = req.Offset
+		if req.Subject != _EMPTY_ {
+			filter = req.Subject
+		}
 	}
 
 	// Clustered mode will invoke a scatter and gather.
 	if s.JetStreamIsClustered() {
 		// Need to copy these off before sending..
-		msg = append(msg[:0:0], msg...)
-		s.startGoRoutine(func() { s.jsClusteredStreamListRequest(acc, ci, offset, subject, reply, msg) })
+		msg = copyBytes(msg)
+		s.startGoRoutine(func() { s.jsClusteredStreamListRequest(acc, ci, filter, offset, subject, reply, msg) })
 		return
 	}
 
 	// TODO(dlc) - Maybe hold these results for large results that we expect to be paged.
 	// TODO(dlc) - If this list is long maybe do this in a Go routine?
-	msets := acc.streams()
+	var msets []*stream
+	if filter == _EMPTY_ {
+		msets = acc.streams()
+	} else {
+		msets = acc.filteredStreams(filter)
+	}
+
 	sort.Slice(msets, func(i, j int) bool {
 		return strings.Compare(msets[i].cfg.Name, msets[j].cfg.Name) < 0
 	})
@@ -3360,7 +3382,7 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, _ *Account,
 
 	// Clustered mode will invoke a scatter and gather.
 	if s.JetStreamIsClustered() {
-		msg = append(msg[:0:0], msg...)
+		msg = copyBytes(msg)
 		s.startGoRoutine(func() {
 			s.jsClusteredConsumerListRequest(acc, ci, offset, streamName, subject, reply, msg)
 		})

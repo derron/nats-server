@@ -425,7 +425,8 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	mset.pubAck = mset.pubAck[:end:end]
 
 	// Set our known last sequence.
-	state := mset.store.State()
+	var state StreamState
+	mset.store.FastState(&state)
 	mset.lseq = state.LastSeq
 
 	// If no msgs (new stream), set dedupe state loaded to true.
@@ -871,6 +872,10 @@ func checkStreamCfg(config *StreamConfig) (StreamConfig, error) {
 			cfg.Subjects = append(cfg.Subjects, cfg.Name)
 		}
 	} else {
+		if cfg.Mirror != nil {
+			return StreamConfig{}, fmt.Errorf("stream mirrors may not have subjects")
+		}
+
 		// We can allow overlaps, but don't allow direct duplicates.
 		dset := make(map[string]struct{}, len(cfg.Subjects))
 		for _, subj := range cfg.Subjects {
@@ -881,7 +886,11 @@ func checkStreamCfg(config *StreamConfig) (StreamConfig, error) {
 			if subjectIsSubsetMatch(subj, "$JS.API.>") {
 				return StreamConfig{}, fmt.Errorf("subjects overlap with jetstream api")
 			}
-
+			// Make sure the subject is valid.
+			if !IsValidSubject(subj) {
+				return StreamConfig{}, fmt.Errorf("invalid subject")
+			}
+			// Mark for duplicate check.
 			dset[subj] = struct{}{}
 		}
 	}
@@ -1692,7 +1701,7 @@ func (mset *stream) setupMirrorConsumer() error {
 
 				// Process inbound mirror messages from the wire.
 				sub, err := mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
-					hdr, msg := c.msgParts(append(rmsg[:0:0], rmsg...)) // Need to copy.
+					hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
 					mset.queueInbound(msgs, subject, reply, hdr, msg)
 				})
 				if err != nil {
@@ -1786,6 +1795,9 @@ func (mset *stream) setSourceConsumer(iname string, seq uint64) {
 	si.sseq, si.dseq = seq, 0
 	si.last = time.Now()
 	ssi := mset.streamSource(iname)
+	if ssi == nil {
+		return
+	}
 
 	// Determine subjects etc.
 	var deliverSubject string
@@ -1881,7 +1893,7 @@ func (mset *stream) setSourceConsumer(iname string, seq uint64) {
 					si.cname = ccr.ConsumerInfo.Name
 					// Now create sub to receive messages.
 					sub, err := mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
-						hdr, msg := c.msgParts(append(rmsg[:0:0], rmsg...)) // Need to copy.
+						hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
 						mset.queueInbound(si.msgs, subject, reply, hdr, msg)
 					})
 					if err != nil {
@@ -2655,10 +2667,10 @@ func (mset *stream) queueInbound(ib *inbound, subj, rply string, hdr, msg []byte
 func (mset *stream) queueInboundMsg(subj, rply string, hdr, msg []byte) {
 	// Copy these.
 	if len(hdr) > 0 {
-		hdr = append(hdr[:0:0], hdr...)
+		hdr = copyBytes(hdr)
 	}
 	if len(msg) > 0 {
-		msg = append(msg[:0:0], msg...)
+		msg = copyBytes(msg)
 	}
 	mset.queueInbound(mset.msgs, subj, rply, hdr, msg)
 }
@@ -2686,7 +2698,7 @@ func (mset *stream) processInboundJetStreamMsg(_ *subscription, c *client, _ *Ac
 
 	hdr, msg := c.msgParts(rmsg)
 
-	// If we are not receiving directly from a client we should move this this Go routine.
+	// If we are not receiving directly from a client we should move this to another Go routine.
 	if c.kind != CLIENT {
 		mset.queueInboundMsg(subject, reply, hdr, msg)
 		return
@@ -3173,7 +3185,7 @@ func (mset *stream) subjects() []string {
 	if len(mset.cfg.Subjects) == 0 {
 		return nil
 	}
-	return append(mset.cfg.Subjects[:0:0], mset.cfg.Subjects...)
+	return copyStrings(mset.cfg.Subjects)
 }
 
 // Linked list for async ack of messages.
@@ -3502,11 +3514,6 @@ func (mset *stream) lookupConsumer(name string) *consumer {
 	return mset.consumers[name]
 }
 
-// State will return the current state for this stream.
-func (mset *stream) state() StreamState {
-	return mset.stateWithDetail(false)
-}
-
 func (mset *stream) numDirectConsumers() (num int) {
 	mset.mu.RLock()
 	defer mset.mu.RUnlock()
@@ -3522,6 +3529,11 @@ func (mset *stream) numDirectConsumers() (num int) {
 	return num
 }
 
+// State will return the current state for this stream.
+func (mset *stream) state() StreamState {
+	return mset.stateWithDetail(false)
+}
+
 func (mset *stream) stateWithDetail(details bool) StreamState {
 	mset.mu.RLock()
 	c, store := mset.client, mset.store
@@ -3530,10 +3542,12 @@ func (mset *stream) stateWithDetail(details bool) StreamState {
 		return StreamState{}
 	}
 	// Currently rely on store.
-	state := store.State()
-	if !details {
-		state.Deleted = nil
+	if details {
+		return store.State()
 	}
+	// Here we do the fast version.
+	var state StreamState
+	mset.store.FastState(&state)
 	return state
 }
 

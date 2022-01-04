@@ -427,6 +427,14 @@ func (c *client) String() (id string) {
 	return _EMPTY_
 }
 
+// GetNonce returns the nonce that was presented to the user on connection
+func (c *client) GetNonce() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.nonce
+}
+
 // GetName returns the application supplied name for the connection.
 func (c *client) GetName() string {
 	c.mu.Lock()
@@ -1026,17 +1034,6 @@ func (c *client) writeLoop() {
 // sent to during processing. We pass in a budget as a time.Duration
 // for how much time to spend in place flushing for this client.
 func (c *client) flushClients(budget time.Duration) time.Time {
-	return c.flushClientsWithCheck(budget, false)
-}
-
-// flushClientsWithCheck will make sure to flush any clients we may have
-// sent to during processing. We pass in a budget as a time.Duration
-// for how much time to spend in place flushing for this client.
-// The 'clientsKindOnly' boolean indicates whether to check kind of client
-// and pending client to run flushOutbound in flushClientsWithCheck.
-// flushOutbound() could block the caller up to the write deadline when
-// the receiving client cannot drain data from the socket fast enough.
-func (c *client) flushClientsWithCheck(budget time.Duration, clientsKindOnly bool) time.Time {
 	last := time.Now().UTC()
 
 	// Check pending clients for flush.
@@ -1057,7 +1054,7 @@ func (c *client) flushClientsWithCheck(budget time.Duration, clientsKindOnly boo
 			continue
 		}
 
-		if budget > 0 && (!clientsKindOnly || c.kind == CLIENT && cp.kind == CLIENT) && cp.out.lft < 2*budget && cp.flushOutbound() {
+		if budget > 0 && cp.out.lft < 2*budget && cp.flushOutbound() {
 			budget -= cp.out.lft
 		} else {
 			cp.flushSignal()
@@ -1199,17 +1196,8 @@ func (c *client) readLoop(pre []byte) {
 			atomic.AddInt64(&s.inBytes, int64(c.in.bytes))
 		}
 
-		// Budget to spend in place flushing outbound data.
-		// Client will be checked on several fronts to see
-		// if applicable. Routes and Gateways will never
-		// spend time flushing outbound in place.
-		var budget time.Duration
-		if c.kind == CLIENT {
-			budget = time.Millisecond
-		}
-
-		// Flush, or signal to writeLoop to flush to socket.
-		last := c.flushClientsWithCheck(budget, true)
+		// Signal to writeLoop to flush to socket.
+		last := c.flushClients(0)
 
 		// Update activity, check read buffer size.
 		c.mu.Lock()
@@ -2417,6 +2405,14 @@ func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForw
 			c.mu.Unlock()
 			c.subPermissionViolation(sub)
 			return nil, ErrSubscribePermissionViolation
+		}
+
+		if opts := srv.getOpts(); opts != nil && opts.MaxSubTokens > 0 {
+			if len(bytes.Split(sub.subject, []byte(tsep))) > int(opts.MaxSubTokens) {
+				c.mu.Unlock()
+				c.maxTokensViolation(sub)
+				return nil, ErrTooManySubTokens
+			}
 		}
 	}
 
@@ -3855,7 +3851,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	// Send tracking info here if we are tracking this response.
 	// This is always a response.
 	var didSendTL bool
-	if si.tracking {
+	if si.tracking && !si.didDeliver {
 		// Stamp that we attempted delivery.
 		si.didDeliver = true
 		didSendTL = acc.sendTrackingLatency(si, c)
@@ -4383,6 +4379,14 @@ func (c *client) subPermissionViolation(sub *subscription) {
 func (c *client) replySubjectViolation(reply []byte) {
 	c.sendErr(fmt.Sprintf("Permissions Violation for Publish with Reply of %q", reply))
 	c.Errorf("Publish Violation - %s, Reply %q", c.getAuthUser(), reply)
+}
+
+func (c *client) maxTokensViolation(sub *subscription) {
+	errTxt := fmt.Sprintf("Permissions Violation for Subscription to %q, too many tokens", sub.subject)
+	logTxt := fmt.Sprintf("Subscription Violation Too Many Tokens - %s, Subject %q, SID %s",
+		c.getAuthUser(), sub.subject, sub.sid)
+	c.sendErr(errTxt)
+	c.Errorf(logTxt)
 }
 
 func (c *client) processPingTimer() {
@@ -5168,7 +5172,9 @@ func convertAllowedConnectionTypes(cts []string) (map[string]struct{}, error) {
 	for _, i := range cts {
 		i = strings.ToUpper(i)
 		switch i {
-		case jwt.ConnectionTypeStandard, jwt.ConnectionTypeWebsocket, jwt.ConnectionTypeLeafnode, jwt.ConnectionTypeMqtt:
+		case jwt.ConnectionTypeStandard, jwt.ConnectionTypeWebsocket,
+			jwt.ConnectionTypeLeafnode, jwt.ConnectionTypeLeafnodeWS,
+			jwt.ConnectionTypeMqtt:
 			m[i] = struct{}{}
 		default:
 			unknown = append(unknown, i)
@@ -5202,7 +5208,11 @@ func (c *client) connectionTypeAllowed(acts map[string]struct{}) bool {
 			want = jwt.ConnectionTypeMqtt
 		}
 	case LEAF:
-		want = jwt.ConnectionTypeLeafnode
+		if c.isWebsocket() {
+			want = jwt.ConnectionTypeLeafnodeWS
+		} else {
+			want = jwt.ConnectionTypeLeafnode
+		}
 	}
 	_, ok := acts[want]
 	return ok
