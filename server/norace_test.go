@@ -27,6 +27,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"runtime"
 	"runtime/debug"
@@ -3331,7 +3332,8 @@ func TestNoRaceJetStreamClusterCorruptWAL(t *testing.T) {
 		}
 	}
 	// Make sure acks processed.
-	nc.Flush()
+	time.Sleep(200 * time.Millisecond)
+	nc.Close()
 
 	// Check consumer consistency.
 	checkConsumerWith := func(delivered, ackFloor uint64, ackPending int) {
@@ -3382,6 +3384,7 @@ func TestNoRaceJetStreamClusterCorruptWAL(t *testing.T) {
 	node := o.raftNode().(*raft)
 	fs := node.wal.(*fileStore)
 	fcfg, cfg := fs.fcfg, fs.cfg.StreamConfig
+	// Stop all the servers.
 	c.stopAll()
 
 	// Manipulate directly with cluster down.
@@ -3450,8 +3453,15 @@ func TestNoRaceJetStreamClusterCorruptWAL(t *testing.T) {
 	state = fs.State()
 	fs.Truncate(state.FirstSeq)
 
+	sub, err = js.PullSubscribe("foo", "dlc")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
 	// This will cause us to stepdown and truncate our WAL.
-	fetchMsgs(t, sub, 100, 50*time.Millisecond)
+	if _, err = sub.Fetch(100); err != nil {
+		t.Fatal(err)
+	}
 
 	checkFor(t, 20*time.Second, 500*time.Millisecond, func() error {
 		// Make sure we changed leaders.
@@ -3916,5 +3926,273 @@ func TestNoRaceJetStreamClusterStreamDropCLFS(t *testing.T) {
 	require_NoError(t, err)
 	if msetNew != mset {
 		t.Fatalf("Stream was reset")
+	}
+}
+
+func TestNoRaceJetStreamMemstoreWithLargeInteriorDeletes(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	config := s.JetStreamConfig()
+	if config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:              "TEST",
+		Subjects:          []string{"foo", "bar"},
+		MaxMsgsPerSubject: 1,
+		Storage:           nats.MemoryStorage,
+	})
+	require_NoError(t, err)
+
+	acc, err := s.lookupAccount("$G")
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	msg := []byte("Hello World!")
+	if _, err := js.PublishAsync("foo", msg); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
+	for i := 1; i <= 1_000_000; i++ {
+		if _, err := js.PublishAsync("bar", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	now := time.Now()
+	ss := mset.stateWithDetail(true)
+	// Before the fix the snapshot for this test would be > 200ms on my setup.
+	if elapsed := time.Since(now); elapsed > 50*time.Millisecond {
+		t.Fatalf("Took too long to snapshot: %v", elapsed)
+	}
+
+	if ss.Msgs != 2 || ss.FirstSeq != 1 || ss.LastSeq != 1_000_001 || ss.NumDeleted != 999999 {
+		// To not print out on error.
+		ss.Deleted = nil
+		t.Fatalf("Bad State: %+v", ss)
+	}
+}
+
+// This is related to an issue reported where we were exhausting threads by trying to
+// cleanup too many consumers at the same time.
+// https://github.com/nats-io/nats-server/issues/2742
+func TestNoRaceConsumerFileStoreConcurrentDiskIO(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	// Artificially adjust our environment for this test.
+	gmp := runtime.GOMAXPROCS(32)
+	defer runtime.GOMAXPROCS(gmp)
+
+	maxT := debug.SetMaxThreads(64)
+	defer debug.SetMaxThreads(maxT)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "MT", Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	startCh := make(chan bool)
+	var wg sync.WaitGroup
+	var swg sync.WaitGroup
+
+	ts := time.Now().UnixNano()
+
+	// Create 1000 consumerStores
+	n := 1000
+	swg.Add(n)
+
+	for i := 1; i <= n; i++ {
+		name := fmt.Sprintf("o%d", i)
+		o, err := fs.ConsumerStore(name, &ConsumerConfig{AckPolicy: AckExplicit})
+		require_NoError(t, err)
+		wg.Add(1)
+		swg.Done()
+
+		go func() {
+			defer wg.Done()
+			// Will make everyone run concurrently.
+			<-startCh
+			o.UpdateDelivered(22, 22, 1, ts)
+			buf, _ := o.(*consumerFileStore).encodeState()
+			o.(*consumerFileStore).writeState(buf)
+			o.Delete()
+		}()
+	}
+
+	swg.Wait()
+	close(startCh)
+	wg.Wait()
+}
+
+func TestNoRaceJetStreamClusterHealthz(t *testing.T) {
+	c := createJetStreamCluster(t, jsClusterAccountsTempl, "HZ", _EMPTY_, 3, 23033, true)
+	defer c.shutdown()
+
+	nc1, js1 := jsClientConnect(t, c.randomServer(), nats.UserInfo("one", "p"))
+	defer nc1.Close()
+
+	nc2, js2 := jsClientConnect(t, c.randomServer(), nats.UserInfo("two", "p"))
+	defer nc2.Close()
+
+	var err error
+	for _, sname := range []string{"foo", "bar", "baz"} {
+		_, err = js1.AddStream(&nats.StreamConfig{Name: sname, Replicas: 3})
+		require_NoError(t, err)
+		_, err = js2.AddStream(&nats.StreamConfig{Name: sname, Replicas: 3})
+		require_NoError(t, err)
+	}
+	// R1
+	_, err = js1.AddStream(&nats.StreamConfig{Name: "r1", Replicas: 1})
+	require_NoError(t, err)
+
+	// Now shutdown then send a bunch of data.
+	s := c.servers[0]
+	s.Shutdown()
+
+	for i := 0; i < 5_000; i++ {
+		_, err = js1.PublishAsync("foo", []byte("OK"))
+		require_NoError(t, err)
+		_, err = js2.PublishAsync("bar", []byte("OK"))
+		require_NoError(t, err)
+	}
+	select {
+	case <-js1.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+	select {
+	case <-js2.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	s = c.restartServer(s)
+	opts := s.getOpts()
+	opts.HTTPHost = "127.0.0.1"
+	opts.HTTPPort = 11222
+	err = s.StartMonitoring()
+	require_NoError(t, err)
+	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", opts.HTTPPort)
+
+	getHealth := func() (int, *HealthStatus) {
+		resp, err := http.Get(url)
+		require_NoError(t, err)
+		defer resp.Body.Close()
+		body, err := ioutil.ReadAll(resp.Body)
+		require_NoError(t, err)
+		var hs HealthStatus
+		err = json.Unmarshal(body, &hs)
+		require_NoError(t, err)
+		return resp.StatusCode, &hs
+	}
+
+	errors := 0
+	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
+		code, hs := getHealth()
+		if code >= 200 && code < 300 {
+			return nil
+		}
+		errors++
+		return fmt.Errorf("Got %d status with %+v", code, hs)
+	})
+	if errors == 0 {
+		t.Fatalf("Expected to have some errors until we became current, got none")
+	}
+}
+
+// Test that we can receive larger messages with stream subject details.
+// Also test that we will fail at some point and the user can fall back to
+// an orderedconsumer like we do with watch for KV Keys() call.
+func TestNoRaceJetStreamStreamInfoSubjectDetailsLimits(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		jetstream: enabled
+		accounts: {
+		  default: {
+			jetstream: true
+			users: [ {user: me, password: pwd} ]
+			limits { max_payload: 256 }
+		  }
+		}
+	`))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	nc, js := jsClientConnect(t, s, nats.UserInfo("me", "pwd"))
+	defer nc.Close()
+
+	// Make sure we cannot send larger than 256 bytes.
+	// But we can receive larger.
+	sub, err := nc.SubscribeSync("foo")
+	require_NoError(t, err)
+	err = nc.Publish("foo", []byte(strings.Repeat("A", 300)))
+	require_Error(t, err, nats.ErrMaxPayload)
+	sub.Unsubscribe()
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"*", "X.*"},
+	})
+	require_NoError(t, err)
+
+	n := JSMaxSubjectDetails
+	for i := 0; i < n; i++ {
+		_, err := js.PublishAsync(fmt.Sprintf("X.%d", i), []byte("OK"))
+		require_NoError(t, err)
+	}
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not receive completion signal")
+	}
+
+	getInfo := func(filter string) *StreamInfo {
+		t.Helper()
+		// Need to grab StreamInfo by hand for now.
+		req, err := json.Marshal(&JSApiStreamInfoRequest{SubjectsFilter: filter})
+		require_NoError(t, err)
+		resp, err := nc.Request(fmt.Sprintf(JSApiStreamInfoT, "TEST"), req, 5*time.Second)
+		require_NoError(t, err)
+		var si StreamInfo
+		err = json.Unmarshal(resp.Data, &si)
+		require_NoError(t, err)
+		return &si
+	}
+
+	si := getInfo("X.*")
+	if len(si.State.Subjects) != n {
+		t.Fatalf("Expected to get %d subject details, got %d", n, len(si.State.Subjects))
+	}
+
+	// Now add one more message in which will exceed our internal limits for subject details.
+	_, err = js.Publish("foo", []byte("TOO MUCH"))
+	require_NoError(t, err)
+
+	req, err := json.Marshal(&JSApiStreamInfoRequest{SubjectsFilter: nats.AllKeys})
+	require_NoError(t, err)
+	resp, err := nc.Request(fmt.Sprintf(JSApiStreamInfoT, "TEST"), req, 5*time.Second)
+	require_NoError(t, err)
+	var sir JSApiStreamInfoResponse
+	err = json.Unmarshal(resp.Data, &sir)
+	require_NoError(t, err)
+	if !IsNatsErr(sir.Error, JSStreamInfoMaxSubjectsErr) {
+		t.Fatalf("Did not get correct error response: %+v", sir.Error)
 	}
 }

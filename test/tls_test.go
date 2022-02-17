@@ -134,6 +134,39 @@ func TestTLSClientCertificateHasUserID(t *testing.T) {
 	defer nc.Close()
 }
 
+func TestTLSClientCertificateCheckWithAllowedConnectionTypes(t *testing.T) {
+	conf := createConfFile(t, []byte(
+		`
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: "./configs/certs/server-cert.pem"
+			key_file:  "./configs/certs/server-key.pem"
+			timeout: 2
+			ca_file:   "./configs/certs/ca.pem"
+			verify_and_map: true
+		}
+		authorization {
+			users = [
+				{user: derek@nats.io, permissions: { publish:"foo" }, allowed_connection_types: ["WEBSOCKET"]}
+			]
+		}
+	`))
+	defer removeFile(t, conf)
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nurl := fmt.Sprintf("tls://%s:%d", o.Host, o.Port)
+	nc, err := nats.Connect(nurl,
+		nats.ClientCert("./configs/certs/client-id-auth-cert.pem", "./configs/certs/client-id-auth-key.pem"),
+		nats.RootCAs("./configs/certs/ca.pem"))
+	if err == nil {
+		if nc != nil {
+			nc.Close()
+		}
+		t.Fatal("Expected connection to fail, it did not")
+	}
+}
+
 func TestTLSClientCertificateCNBasedAuth(t *testing.T) {
 	srv, opts := RunServerWithConfig("./configs/tls_cert_cn.conf")
 	defer srv.Shutdown()
@@ -1817,6 +1850,74 @@ func TestTLSPinnedCertsClient(t *testing.T) {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
 	nc.Close()
+}
+
+type captureWarnLogger struct {
+	dummyLogger
+	receive chan string
+}
+
+func newCaptureWarnLogger() *captureWarnLogger {
+	return &captureWarnLogger{
+		receive: make(chan string, 100),
+	}
+}
+
+func (l *captureWarnLogger) Warnf(format string, v ...interface{}) {
+	l.receive <- fmt.Sprintf(format, v...)
+}
+
+func (l *captureWarnLogger) waitFor(expect string, timeout time.Duration) bool {
+	for {
+		select {
+		case msg := <-l.receive:
+			if strings.Contains(msg, expect) {
+				return true
+			}
+		case <-time.After(timeout):
+			return false
+		}
+	}
+}
+
+func TestTLSConnectionRate(t *testing.T) {
+	config := `
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: "./configs/certs/server-cert.pem"
+			key_file:  "./configs/certs/server-key.pem"
+			connection_rate_limit: 3
+		}
+	`
+
+	confFileName := createConfFile(t, []byte(config))
+	defer removeFile(t, confFileName)
+
+	srv, _ := RunServerWithConfig(confFileName)
+	logger := newCaptureWarnLogger()
+	srv.SetLogger(logger, false, false)
+	defer srv.Shutdown()
+
+	var err error
+	count := 0
+	for count < 10 {
+		var nc *nats.Conn
+		nc, err = nats.Connect(srv.ClientURL(), nats.RootCAs("./configs/certs/ca.pem"))
+
+		if err != nil {
+			break
+		}
+		nc.Close()
+		count++
+	}
+
+	if count != 3 {
+		t.Fatalf("Expected 3 connections per second, got %d (%v)", count, err)
+	}
+
+	if !logger.waitFor("connections due to TLS rate limiting", time.Second) {
+		t.Fatalf("did not log 'TLS rate limiting' warning")
+	}
 }
 
 func TestTLSPinnedCertsRoute(t *testing.T) {

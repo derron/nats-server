@@ -448,7 +448,7 @@ func TestFileStoreWriteExpireWrite(t *testing.T) {
 	for i := 1; i <= toSend*2; i++ {
 		subj, _, msg, _, err := fs.LoadMsg(uint64(i))
 		if err != nil {
-			t.Fatalf("Unexpected error looking up seq 11: %v", err)
+			t.Fatalf("Unexpected error looking up seq %d: %v", i, err)
 		}
 		str := "Hello World!"
 		if i > toSend {
@@ -1409,7 +1409,7 @@ func TestFileStoreMeta(t *testing.T) {
 	if err := json.Unmarshal(buf, &oconfig2); err != nil {
 		t.Fatalf("Error unmarshalling: %v", err)
 	}
-	if oconfig2 != oconfig {
+	if !reflect.DeepEqual(oconfig2, oconfig) {
 		t.Fatalf("Consumer configs not equal, got %+v vs %+v", oconfig2, oconfig)
 	}
 	checksum, err = ioutil.ReadFile(ometasum)
@@ -2008,6 +2008,44 @@ func TestFileStoreConsumerEncodeDecodeRedelivered(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if !reflect.DeepEqual(state, rstate) {
+		t.Fatalf("States do not match: %+v vs %+v", state, rstate)
+	}
+}
+
+func TestFileStoreConsumerEncodeDecodePendingBelowStreamAckFloor(t *testing.T) {
+	state := &ConsumerState{}
+
+	state.Delivered.Consumer = 1192
+	state.Delivered.Stream = 10185
+	state.AckFloor.Consumer = 1189
+	state.AckFloor.Stream = 10815
+
+	now := time.Now().Round(time.Second).Add(-10 * time.Second).UnixNano()
+	state.Pending = map[uint64]*Pending{
+		10782: {1190, now},
+		10810: {1191, now + int64(time.Second)},
+		10815: {1192, now + int64(2*time.Second)},
+	}
+	buf := encodeConsumerState(state)
+
+	rstate, err := decodeConsumerState(buf)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(rstate.Pending) != 3 {
+		t.Fatalf("Invalid pending: %v", rstate.Pending)
+	}
+	for k, v := range state.Pending {
+		rv, ok := rstate.Pending[k]
+		if !ok {
+			t.Fatalf("Did not find sseq=%v", k)
+		}
+		if !reflect.DeepEqual(v, rv) {
+			t.Fatalf("Pending for sseq=%v should be %+v, got %+v", k, v, rv)
+		}
+	}
+	state.Pending, rstate.Pending = nil, nil
+	if !reflect.DeepEqual(*state, *rstate) {
 		t.Fatalf("States do not match: %+v vs %+v", state, rstate)
 	}
 }
@@ -3410,4 +3448,94 @@ func TestFileStorePurgeExKeepOneBug(t *testing.T) {
 	if fss := fs.FilteredState(1, "A"); fss.Msgs != 1 {
 		t.Fatalf("Expected to find 1 `A` msgs, got %d", fss.Msgs)
 	}
+}
+
+func TestFileStoreRemoveLastWriteIndex(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "TEST", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	for i := 0; i < 10; i++ {
+		fs.StoreMsg("foo", nil, []byte("msg"))
+	}
+	for i := 0; i < 10; i++ {
+		fs.RemoveMsg(uint64(i + 1))
+	}
+
+	fs.mu.Lock()
+	fname := fs.lmb.ifn
+	fs.mu.Unlock()
+
+	fi, err := os.Stat(fname)
+	if err != nil {
+		t.Fatalf("Error getting stats for index file %q: %v", fname, err)
+	}
+	if fi.Size() == 0 {
+		t.Fatalf("Index file %q size is 0", fname)
+	}
+}
+
+func TestFileStoreFilteredPendingBug(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "TEST", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	fs.StoreMsg("foo", nil, []byte("msg"))
+	fs.StoreMsg("bar", nil, []byte("msg"))
+	fs.StoreMsg("baz", nil, []byte("msg"))
+
+	fs.mu.Lock()
+	mb := fs.lmb
+	fs.mu.Unlock()
+
+	total, f, l := mb.filteredPending("foo", false, 3)
+	if total != 0 {
+		t.Fatalf("Expected total of 0 but got %d", total)
+	}
+	if f != 0 || l != 0 {
+		t.Fatalf("Expected first and last to be 0 as well, but got %d %d", f, l)
+	}
+}
+
+// Test to optimize the selectMsgBlock with lots of blocks.
+func TestFileStoreFetchPerf(t *testing.T) {
+	// Comment out to run.
+	t.SkipNow()
+
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 8192, AsyncFlush: true}, StreamConfig{Name: "TEST", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	// Will create 25k msg blocks.
+	n, subj, msg := 100_000, "zzz", bytes.Repeat([]byte("ABC"), 600)
+	for i := 0; i < n; i++ {
+		if _, _, err := fs.StoreMsg(subj, nil, msg); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	// Time how long it takes us to load all messages.
+	now := time.Now()
+	for i := 0; i < n; i++ {
+		_, _, _, _, err := fs.LoadMsg(uint64(i))
+		if err != nil {
+			t.Fatalf("Unexpected error looking up seq %d: %v", i, err)
+		}
+	}
+	fmt.Printf("Elapsed to load all messages is %v\n", time.Since(now))
 }

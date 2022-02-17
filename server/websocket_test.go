@@ -1794,22 +1794,33 @@ type testWSClientOptions struct {
 	compress, web bool
 	host          string
 	port          int
-	extraHeaders  map[string]string
+	extraHeaders  map[string][]string
 	noTLS         bool
+	path          string
 }
 
 func testNewWSClient(t testing.TB, o testWSClientOptions) (net.Conn, *bufio.Reader, []byte) {
 	t.Helper()
+	c, br, info, err := testNewWSClientWithError(t, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, br, info
+}
+
+func testNewWSClientWithError(t testing.TB, o testWSClientOptions) (net.Conn, *bufio.Reader, []byte, error) {
 	addr := fmt.Sprintf("%s:%d", o.host, o.port)
 	wsc, err := net.Dial("tcp", addr)
 	if err != nil {
-		t.Fatalf("Error creating ws connection: %v", err)
+		return nil, nil, nil, fmt.Errorf("Error creating ws connection: %v", err)
 	}
 	if !o.noTLS {
 		wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
+		wsc.SetDeadline(time.Now().Add(time.Second))
 		if err := wsc.(*tls.Conn).Handshake(); err != nil {
-			t.Fatalf("Error during handshake: %v", err)
+			return nil, nil, nil, fmt.Errorf("Error during handshake: %v", err)
 		}
+		wsc.SetDeadline(time.Time{})
 	}
 	req := testWSCreateValidReq()
 	if o.compress {
@@ -1818,30 +1829,44 @@ func testNewWSClient(t testing.TB, o testWSClientOptions) (net.Conn, *bufio.Read
 	if o.web {
 		req.Header.Set("User-Agent", "Mozilla/5.0")
 	}
-	if o.extraHeaders != nil {
-		for hdr, val := range o.extraHeaders {
-			req.Header.Add(hdr, val)
+	if len(o.extraHeaders) > 0 {
+		for hdr, values := range o.extraHeaders {
+			if len(values) == 0 {
+				req.Header.Set(hdr, _EMPTY_)
+				continue
+			}
+			req.Header.Set(hdr, values[0])
+			for i := 1; i < len(values); i++ {
+				req.Header.Add(hdr, values[i])
+			}
 		}
 	}
-	req.URL, _ = url.Parse("wss://" + addr)
+	req.URL, _ = url.Parse("wss://" + addr + o.path)
 	if err := req.Write(wsc); err != nil {
-		t.Fatalf("Error sending request: %v", err)
+		return nil, nil, nil, fmt.Errorf("Error sending request: %v", err)
 	}
 	br := bufio.NewReader(wsc)
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
-		t.Fatalf("Error reading response: %v", err)
+		return nil, nil, nil, fmt.Errorf("Error reading response: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Expected response status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
+		return nil, nil, nil, fmt.Errorf("Expected response status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
 	}
-	// Wait for the INFO
-	info := testWSReadFrame(t, br)
-	if !bytes.HasPrefix(info, []byte("INFO {")) {
-		t.Fatalf("Expected INFO, got %s", info)
+	var info []byte
+	if o.path == mqttWSPath {
+		if v := resp.Header[wsSecProto]; len(v) != 1 || v[0] != wsMQTTSecProtoVal {
+			return nil, nil, nil, fmt.Errorf("No mqtt protocol in header: %v", resp.Header)
+		}
+	} else {
+		// Wait for the INFO
+		info = testWSReadFrame(t, br)
+		if !bytes.HasPrefix(info, []byte("INFO {")) {
+			return nil, nil, nil, fmt.Errorf("Expected INFO, got %s", info)
+		}
 	}
-	return wsc, br, info
+	return wsc, br, info, nil
 }
 
 type testClaimsOptions struct {
@@ -3788,8 +3813,8 @@ func TestWSJWTCookieUser(t *testing.T) {
 			nuc:  nucSigFunc(),
 			opts: func(t *testing.T, claims *jwt.UserClaims) (testWSClientOptions, testClaimsOptions) {
 				co := cliOpts
-				co.extraHeaders = map[string]string{}
-				co.extraHeaders["Cookie"] = o.Websocket.JWTCookie + "=" + genJwt(t, claims)
+				co.extraHeaders = map[string][]string{}
+				co.extraHeaders["Cookie"] = []string{o.Websocket.JWTCookie + "=" + genJwt(t, claims)}
 				return co, testClaimsOptions{connectRequest: struct{}{}}
 			},
 			expectAnswer: "-ERR",
@@ -3799,8 +3824,8 @@ func TestWSJWTCookieUser(t *testing.T) {
 			nuc:  nucBearerFunc(),
 			opts: func(t *testing.T, claims *jwt.UserClaims) (testWSClientOptions, testClaimsOptions) {
 				co := cliOpts
-				co.extraHeaders = map[string]string{}
-				co.extraHeaders["Cookie"] = o.Websocket.JWTCookie + "=" + genJwt(t, claims)
+				co.extraHeaders = map[string][]string{}
+				co.extraHeaders["Cookie"] = []string{o.Websocket.JWTCookie + "=" + genJwt(t, claims)}
 				return co, testClaimsOptions{connectRequest: struct{}{}}
 			},
 			expectAnswer: "+OK",
@@ -3810,8 +3835,8 @@ func TestWSJWTCookieUser(t *testing.T) {
 			nuc:  nucSigFunc(),
 			opts: func(t *testing.T, claims *jwt.UserClaims) (testWSClientOptions, testClaimsOptions) {
 				co := cliOpts
-				co.extraHeaders = map[string]string{}
-				co.extraHeaders["Cookie"] = o.Websocket.JWTCookie + "=" + genJwt(t, claims)
+				co.extraHeaders = map[string][]string{}
+				co.extraHeaders["Cookie"] = []string{o.Websocket.JWTCookie + "=" + genJwt(t, claims)}
 				return co, testClaimsOptions{nuc: nucBearerFunc()}
 			},
 			expectAnswer: "+OK",
@@ -3881,6 +3906,101 @@ func TestWSReloadTLSConfig(t *testing.T) {
 	wsc = tls.Client(wsc, tlsConfig.Clone())
 	if err := wsc.(*tls.Conn).Handshake(); err != nil {
 		t.Fatalf("Error on TLS handshake: %v", err)
+	}
+}
+
+type captureClientConnectedLogger struct {
+	DummyLogger
+	ch chan string
+}
+
+func (l *captureClientConnectedLogger) Debugf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	if !strings.Contains(msg, "Client connection created") {
+		return
+	}
+	select {
+	case l.ch <- msg:
+	default:
+	}
+}
+
+func TestWSXForwardedFor(t *testing.T) {
+	o := testWSOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	l := &captureClientConnectedLogger{ch: make(chan string, 1)}
+	s.SetLogger(l, true, false)
+
+	for _, test := range []struct {
+		name          string
+		headers       func() map[string][]string
+		useHdrValue   bool
+		expectedValue string
+	}{
+		{"nil map", func() map[string][]string {
+			return nil
+		}, false, _EMPTY_},
+		{"empty map", func() map[string][]string {
+			return make(map[string][]string)
+		}, false, _EMPTY_},
+		{"header present empty value", func() map[string][]string {
+			m := make(map[string][]string)
+			m[wsXForwardedForHeader] = []string{}
+			return m
+		}, false, _EMPTY_},
+		{"header present invalid IP", func() map[string][]string {
+			m := make(map[string][]string)
+			m[wsXForwardedForHeader] = []string{"not a valid IP"}
+			return m
+		}, false, _EMPTY_},
+		{"header present one IP", func() map[string][]string {
+			m := make(map[string][]string)
+			m[wsXForwardedForHeader] = []string{"1.2.3.4"}
+			return m
+		}, true, "1.2.3.4"},
+		{"header present multiple IPs", func() map[string][]string {
+			m := make(map[string][]string)
+			m[wsXForwardedForHeader] = []string{"1.2.3.4", "5.6.7.8"}
+			return m
+		}, true, "1.2.3.4"},
+		{"header present IPv6", func() map[string][]string {
+			m := make(map[string][]string)
+			m[wsXForwardedForHeader] = []string{"::1"}
+			return m
+		}, true, "[::1]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, r, _ := testNewWSClient(t, testWSClientOptions{
+				host:         o.Websocket.Host,
+				port:         o.Websocket.Port,
+				extraHeaders: test.headers(),
+			})
+			defer c.Close()
+			// Send CONNECT and PING
+			wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("CONNECT {\"verbose\":false,\"protocol\":1}\r\nPING\r\n"))
+			if _, err := c.Write(wsmsg); err != nil {
+				t.Fatalf("Error sending message: %v", err)
+			}
+			// Wait for the PONG
+			if msg := testWSReadFrame(t, r); !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
+				t.Fatalf("Expected PONG, got %s", msg)
+			}
+			select {
+			case d := <-l.ch:
+				ipAndSlash := fmt.Sprintf("%s/", test.expectedValue)
+				if test.useHdrValue {
+					if !strings.HasPrefix(d, ipAndSlash) {
+						t.Fatalf("Expected debug statement to start with: %q, got %q", ipAndSlash, d)
+					}
+				} else if strings.HasPrefix(d, ipAndSlash) {
+					t.Fatalf("Unexpected debug statement: %q", d)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Did not get connect debug statement")
+			}
+		})
 	}
 }
 

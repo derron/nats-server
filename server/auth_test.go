@@ -14,12 +14,17 @@
 package server
 
 import (
+	"fmt"
+	"net"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
 )
 
 func TestUserCloneNilPermissions(t *testing.T) {
@@ -211,4 +216,105 @@ func TestDNSAltNameMatching(t *testing.T) {
 			t.Fatal("Test", idx, "Match miss match, expected:", test.match)
 		}
 	}
+}
+
+func TestNoAuthUser(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts {
+			FOO { users [{user: "foo", password: "pwd1"}] }
+			BAR { users [{user: "bar", password: "pwd2"}] }
+		}
+		no_auth_user: "foo"
+	`))
+	defer os.Remove(conf)
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	for _, test := range []struct {
+		name    string
+		usrInfo string
+		ok      bool
+		account string
+	}{
+		{"valid user/pwd", "bar:pwd2@", true, "BAR"},
+		{"invalid pwd", "bar:wrong@", false, _EMPTY_},
+		{"some token", "sometoken@", false, _EMPTY_},
+		{"user used without pwd", "bar@", false, _EMPTY_}, // will be treated as a token
+		{"user with empty password", "bar:@", false, _EMPTY_},
+		{"no user", _EMPTY_, true, "FOO"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			url := fmt.Sprintf("nats://%s127.0.0.1:%d", test.usrInfo, o.Port)
+			nc, err := nats.Connect(url)
+			if err != nil {
+				if test.ok {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				return
+			} else if !test.ok {
+				nc.Close()
+				t.Fatalf("Should have failed, did not")
+			}
+			var accName string
+			s.mu.Lock()
+			for _, c := range s.clients {
+				c.mu.Lock()
+				if c.acc != nil {
+					accName = c.acc.Name
+				}
+				c.mu.Unlock()
+				break
+			}
+			s.mu.Unlock()
+			nc.Close()
+			checkClientsCount(t, s, 0)
+			if accName != test.account {
+				t.Fatalf("The account should have been %q, got %q", test.account, accName)
+			}
+		})
+	}
+}
+
+func TestNoAuthUserNoConnectProto(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts {
+			A { users [{user: "foo", password: "pwd"}] }
+		}
+		authorization { timeout: 1 }
+		no_auth_user: "foo"
+	`))
+	defer os.Remove(conf)
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	checkClients := func(n int) {
+		t.Helper()
+		time.Sleep(100 * time.Millisecond)
+		if nc := s.NumClients(); nc != n {
+			t.Fatalf("Expected %d clients, got %d", n, nc)
+		}
+	}
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", o.Host, o.Port))
+	require_NoError(t, err)
+	defer conn.Close()
+	checkClientsCount(t, s, 1)
+
+	// With no auth user we should not require a CONNECT.
+	// Make sure we are good on not sending CONN first.
+	_, err = conn.Write([]byte("PUB foo 2\r\nok\r\n"))
+	require_NoError(t, err)
+	checkClients(1)
+	conn.Close()
+
+	// Now make sure we still do get timed out though.
+	conn, err = net.Dial("tcp", fmt.Sprintf("%s:%d", o.Host, o.Port))
+	require_NoError(t, err)
+	defer conn.Close()
+	checkClientsCount(t, s, 1)
+
+	time.Sleep(1200 * time.Millisecond)
+	checkClientsCount(t, s, 0)
 }

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/url"
@@ -96,7 +97,7 @@ func LoadConfig(configFile string) (opts *Options) {
 	if err != nil {
 		panic(fmt.Sprintf("Error processing configuration file: %v", err))
 	}
-	opts.NoSigs, opts.NoLog = true, true
+	opts.NoSigs, opts.NoLog = true, opts.LogFile == _EMPTY_
 	return
 }
 
@@ -1278,6 +1279,9 @@ func TestServerShutdownDuringStart(t *testing.T) {
 	ch := make(chan struct{}, 1)
 	go func() {
 		s.Start()
+		// Since the server has already been shutdown and we don't want to leave
+		// the ipqLog run() routine running, stop it now.
+		s.ipqLog.stop()
 		close(ch)
 	}()
 	select {
@@ -1417,17 +1421,23 @@ func TestGetRandomIP(t *testing.T) {
 	}
 }
 
-type slowWriteConn struct {
+type shortWriteConn struct {
 	net.Conn
 }
 
-func (swc *slowWriteConn) Write(b []byte) (int, error) {
+func (swc *shortWriteConn) Write(b []byte) (int, error) {
 	// Limit the write to 10 bytes at a time.
+	short := false
 	max := len(b)
 	if max > 10 {
 		max = 10
+		short = true
 	}
-	return swc.Conn.Write(b[:max])
+	n, err := swc.Conn.Write(b[:max])
+	if err == nil && short {
+		return n, io.ErrShortWrite
+	}
+	return n, err
 }
 
 func TestClientWriteLoopStall(t *testing.T) {
@@ -1464,7 +1474,7 @@ func TestClientWriteLoopStall(t *testing.T) {
 
 	c := s.getClient(cid)
 	c.mu.Lock()
-	c.nc = &slowWriteConn{Conn: c.nc}
+	c.nc = &shortWriteConn{Conn: c.nc}
 	c.mu.Unlock()
 
 	sender.Publish("foo", make([]byte, 100))
@@ -1952,5 +1962,38 @@ func TestServerLogsConfigurationFile(t *testing.T) {
 	}
 	if !bytes.Contains(log, []byte(fmt.Sprintf("Using configuration file: %s", file.Name()))) {
 		t.Fatalf("Config file location was not reported in log: %s", log)
+	}
+}
+
+func TestServerIPQueueLogger(t *testing.T) {
+	o := DefaultOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	l := &captureWarnLogger{warn: make(chan string, 100)}
+	s.SetLogger(l, false, false)
+
+	q := newIPQueue(ipQueue_Logger("test", s.ipqLog))
+	// Normally, lt is immutable and set to ipQueueDefaultWarnThreshold, but
+	// for test, we set it to a low value.
+	q.lt = 2
+	q.push(1)
+	// This one should case a warning
+	q.push(2)
+
+	for {
+		select {
+		case w := <-l.warn:
+			// In case we get other warnings a runtime, just check that we
+			// get the one we expect and be done.
+			if strings.Contains(w, "test queue") {
+				if strings.Contains(w, "test queue pending size: 2") {
+					return
+				}
+				t.Fatalf("Invalid warning: %v", w)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Did not get warning")
+		}
 	}
 }
