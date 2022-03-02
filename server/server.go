@@ -288,6 +288,7 @@ type nodeInfo struct {
 	cluster string
 	domain  string
 	id      string
+	tags    jwt.TagList
 	cfg     *JetStreamConfig
 	stats   *JetStreamStats
 	offline bool
@@ -413,6 +414,7 @@ func NewServer(opts *Options) (*Server, error) {
 			opts.Cluster.Name,
 			opts.JetStreamDomain,
 			info.ID,
+			opts.Tags,
 			&JetStreamConfig{MaxMemory: opts.JetStreamMaxMemory, MaxStore: opts.JetStreamMaxStore},
 			nil,
 			false, true,
