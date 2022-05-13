@@ -204,6 +204,9 @@ const (
 	// JSAdvisoryConsumerMaxDeliveryExceedPre is a notification published when a message exceeds its delivery threshold.
 	JSAdvisoryConsumerMaxDeliveryExceedPre = "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES"
 
+	// JSAdvisoryConsumerMsgNakPre is a notification published when a message has been naked
+	JSAdvisoryConsumerMsgNakPre = "$JS.EVENT.ADVISORY.CONSUMER.MSG_NAKED"
+
 	// JSAdvisoryConsumerMsgTerminatedPre is a notification published when a message has been terminated.
 	JSAdvisoryConsumerMsgTerminatedPre = "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED"
 
@@ -846,12 +849,12 @@ func (a *Account) trackAPI() {
 	jsa := a.js
 	a.mu.RUnlock()
 	if jsa != nil {
-		jsa.mu.Lock()
+		jsa.usageMu.Lock()
 		jsa.usageApi++
 		jsa.apiTotal++
 		jsa.sendClusterUsageUpdate()
 		atomic.AddInt64(&jsa.js.apiTotal, 1)
-		jsa.mu.Unlock()
+		jsa.usageMu.Unlock()
 	}
 }
 
@@ -860,7 +863,7 @@ func (a *Account) trackAPIErr() {
 	jsa := a.js
 	a.mu.RUnlock()
 	if jsa != nil {
-		jsa.mu.Lock()
+		jsa.usageMu.Lock()
 		jsa.usageApi++
 		jsa.apiTotal++
 		jsa.usageErr++
@@ -868,7 +871,7 @@ func (a *Account) trackAPIErr() {
 		jsa.sendClusterUsageUpdate()
 		atomic.AddInt64(&jsa.js.apiTotal, 1)
 		atomic.AddInt64(&jsa.js.apiErrors, 1)
-		jsa.mu.Unlock()
+		jsa.usageMu.Unlock()
 	}
 }
 
@@ -1832,6 +1835,9 @@ func (s *Server) jsStreamLeaderStepDownRequest(sub *subscription, c *client, _ *
 	// Call actual stepdown.
 	if mset != nil {
 		if node := mset.raftNode(); node != nil {
+			mset.setLeader(false)
+			// TODO (mh) eventually make sure all go routines exited and all channels are cleared
+			time.Sleep(250 * time.Millisecond)
 			node.StepDown()
 		}
 	}
@@ -1934,6 +1940,9 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, _
 
 	// Call actual stepdown.
 	if n := o.raftNode(); n != nil {
+		o.setLeader(false)
+		// TODO (mh) eventually make sure all go routines exited and all channels are cleared
+		time.Sleep(250 * time.Millisecond)
 		n.StepDown()
 	}
 

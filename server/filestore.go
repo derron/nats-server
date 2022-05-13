@@ -218,9 +218,9 @@ const (
 	blkKeySize  = 72
 
 	// Default stream block size.
-	defaultLargeBlockSize = 4 * 1024 * 1024 // 4MB
+	defaultLargeBlockSize = 8 * 1024 * 1024 // 8MB
 	// Default for workqueue or interest based.
-	defaultMediumBlockSize = 2 * 1024 * 1024 // 2MB
+	defaultMediumBlockSize = 4 * 1024 * 1024 // 4MB
 	// For smaller reuse buffers. Usually being generated during contention on the lead write buffer.
 	// E.g. mirrors/sources etc.
 	defaultSmallBlockSize = 1 * 1024 * 1024 // 1MB
@@ -238,6 +238,8 @@ const (
 	rlBadThresh = 32 * 1024 * 1024
 	// Time threshold to write index info.
 	wiThresh = int64(2 * time.Second)
+	// Time threshold to write index info for non FIFO cases
+	winfThresh = int64(500 * time.Millisecond)
 )
 
 func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, error) {
@@ -1703,11 +1705,13 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts in
 		return ErrStoreClosed
 	}
 
+	var pscheck bool
+	var asl bool
 	// Check if we are discarding new messages when we reach the limit.
 	if fs.cfg.Discard == DiscardNew {
-		var asl bool
 		var fseq uint64
 		if fs.cfg.MaxMsgsPer > 0 && len(subj) > 0 {
+			pscheck = true
 			var msgs uint64
 			if msgs, fseq, _ = fs.perSubjectState(subj); msgs >= uint64(fs.cfg.MaxMsgsPer) {
 				asl = true
@@ -1758,7 +1762,9 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts in
 
 	// Enforce per message limits.
 	if fs.cfg.MaxMsgsPer > 0 && len(subj) > 0 {
-		fs.enforcePerSubjectLimit(subj)
+		if !pscheck || asl {
+			fs.enforcePerSubjectLimit(subj)
+		}
 	}
 
 	// Limits checks and enforcement.
@@ -2077,8 +2083,12 @@ func (fs *fileStore) removeMsg(seq uint64, secure, needFSLock bool) (bool, error
 			}
 			mb.dmap[seq] = struct{}{}
 			// Check if <25% utilization and minimum size met.
-			if notLast && mb.rbytes > compactMinimum && mb.rbytes>>2 > mb.bytes {
-				mb.compact()
+			if notLast && mb.rbytes > compactMinimum {
+				// Remove the interior delete records
+				rbytes := mb.rbytes - uint64(len(mb.dmap)*emptyRecordLen)
+				if rbytes>>2 > mb.bytes {
+					mb.compact()
+				}
 			}
 		}
 	}
@@ -2097,7 +2107,13 @@ func (fs *fileStore) removeMsg(seq uint64, secure, needFSLock bool) (bool, error
 	// Check if we need to write the index file and we are flush in place (fip).
 	if shouldWriteIndex && fs.fip {
 		// Check if this is the first message, common during expirations etc.
-		if !fifo || time.Now().UnixNano()-mb.lwits > wiThresh {
+		threshold := wiThresh
+		if !fifo {
+			// For out-of-order deletes, we will have a shorter threshold, but
+			// still won't write the index for every single delete.
+			threshold = winfThresh
+		}
+		if time.Now().UnixNano()-mb.lwits > threshold {
 			mb.writeIndexInfoLocked()
 		}
 	}
@@ -4728,8 +4744,6 @@ func (mb *msgBlock) readPerSubjectInfo() error {
 		return mb.generatePerSubjectInfo()
 	}
 
-	fss := make(map[string]*SimpleState)
-
 	bi := hdrLen
 	readU64 := func() uint64 {
 		if bi < 0 {
@@ -4744,8 +4758,11 @@ func (mb *msgBlock) readPerSubjectInfo() error {
 		return num
 	}
 
+	numEntries := readU64()
+	fss := make(map[string]*SimpleState, numEntries)
+
 	mb.mu.Lock()
-	for i, numEntries := uint64(0), readU64(); i < numEntries; i++ {
+	for i := uint64(0); i < numEntries; i++ {
 		lsubj := readU64()
 		// Make a copy or use a configured subject (to avoid mem allocation)
 		subj := mb.subjString(buf[bi : bi+int(lsubj)])
@@ -5164,7 +5181,7 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 	if err := os.MkdirAll(odir, defaultDirPerms); err != nil {
 		return nil, fmt.Errorf("could not create consumer directory - %v", err)
 	}
-	csi := &FileConsumerInfo{ConsumerConfig: *cfg}
+	csi := &FileConsumerInfo{Name: name, Created: time.Now().UTC(), ConsumerConfig: *cfg}
 	o := &consumerFileStore{
 		fs:   fs,
 		cfg:  csi,

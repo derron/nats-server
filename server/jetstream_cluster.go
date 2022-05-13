@@ -350,7 +350,8 @@ func (cc *jetStreamCluster) isCurrent() bool {
 	return cc.meta.Current()
 }
 
-// isStreamCurrent will determine if this node is a participant for the stream and if its up to date.
+// isStreamCurrent will determine if the stream is up to date.
+// For R1 it will make sure the stream is present on this server.
 // Read lock should be held.
 func (cc *jetStreamCluster) isStreamCurrent(account, stream string) bool {
 	if cc == nil {
@@ -366,12 +367,11 @@ func (cc *jetStreamCluster) isStreamCurrent(account, stream string) bool {
 		return false
 	}
 	rg := sa.Group
-	if rg == nil || rg.node == nil {
+	if rg == nil {
 		return false
 	}
 
-	isCurrent := rg.node.Current()
-	if isCurrent {
+	if rg.node == nil || rg.node.Current() {
 		// Check if we are processing a snapshot and are catching up.
 		acc, err := cc.s.LookupAccount(account)
 		if err != nil {
@@ -384,9 +384,37 @@ func (cc *jetStreamCluster) isStreamCurrent(account, stream string) bool {
 		if mset.isCatchingUp() {
 			return false
 		}
+		// Success.
+		return true
 	}
 
-	return isCurrent
+	return false
+}
+
+// isConsumerCurrent will determine if the consumer is up to date.
+// For R1 it will make sure the consunmer is present on this server.
+// Read lock should be held.
+func (cc *jetStreamCluster) isConsumerCurrent(account, stream, consumer string) bool {
+	if cc == nil {
+		// Non-clustered mode
+		return true
+	}
+	acc, err := cc.s.LookupAccount(account)
+	if err != nil {
+		return false
+	}
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		return false
+	}
+	o := mset.lookupConsumer(consumer)
+	if o == nil {
+		return false
+	}
+	if n := o.raftNode(); n != nil && !n.Current() {
+		return false
+	}
+	return true
 }
 
 func (a *Account) getJetStreamFromAccount() (*Server, *jetStream, *jsAccount) {
@@ -630,6 +658,9 @@ func (js *jetStream) isGroupLeaderless(rg *raftGroup) bool {
 	cc := js.cluster
 
 	// If we are not a member we can not say..
+	if cc.meta == nil {
+		return false
+	}
 	if !rg.isMember(cc.meta.ID()) {
 		return false
 	}
@@ -1018,6 +1049,7 @@ func (js *jetStream) applyMetaSnapshot(buf []byte, isRecovering bool) error {
 	// Build our new version here outside of js.
 	streams := make(map[string]map[string]*streamAssignment)
 	for _, wsa := range wsas {
+		fixCfgMirrorWithDedupWindow(wsa.Config)
 		as := streams[wsa.Client.serviceAccount()]
 		if as == nil {
 			as = make(map[string]*streamAssignment)
@@ -1645,7 +1677,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 
 	startMigrationMonitoring := func() {
 		if mmt == nil {
-			mmt = time.NewTicker(250 * time.Millisecond)
+			mmt = time.NewTicker(1 * time.Second)
 			mmtc = mmt.C
 		}
 	}
@@ -1749,6 +1781,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			// new peers to be caught up. We could not be leader yet, so we will do same check below
 			// on leadership change.
 			if isLeader && migrating && peerGroup == oldPeerGroup {
+				doSnapshot()
 				startMigrationMonitoring()
 			}
 		case <-mmtc:
@@ -1758,7 +1791,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				continue
 			}
 			// Check to see that we have someone caught up.
+			// TODO(dlc) - For now start checking after a second in order to give proper time to kick in any catchup logic needed.
+			// What we really need to do longer term is know if we need catchup and make sure that process has kicked off and/or completed.
 			ci := js.clusterInfo(mset.raftGroup())
+			// The polling interval of one second allows this to be kicked in if needed.
 			if mset.hasCatchupPeers() {
 				mset.checkClusterInfo(ci)
 			}
@@ -3108,7 +3144,7 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment, state 
 	var didCreate bool
 	if o == nil {
 		// Add in the consumer if needed.
-		o, err = mset.addConsumerWithAssignment(ca.Config, ca.Name, ca)
+		o, err = mset.addConsumerWithAssignment(ca.Config, ca.Name, ca, false)
 		didCreate = true
 	} else {
 		if err := o.updateConfig(ca.Config); err != nil {
@@ -3228,7 +3264,7 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment, state 
 			js.processConsumerLeaderChange(o, true)
 		} else {
 			if !alreadyRunning {
-				s.startGoRoutine(func() { js.monitorConsumer(o, ca, !didCreate) })
+				s.startGoRoutine(func() { js.monitorConsumer(o, ca) })
 			}
 			// Process if existing.
 			if wasExisting && (o.isLeader() || (!didCreate && rg.node.GroupLeader() == _EMPTY_)) {
@@ -3383,7 +3419,7 @@ func (o *consumer) raftNode() RaftNode {
 	return o.node
 }
 
-func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment, sendSnapshot bool) {
+func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	s, n := js.server(), o.raftNode()
 	defer s.grWG.Done()
 
@@ -3426,22 +3462,12 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment, sendSn
 			needSnap = nb > 0 && ne >= compactNumMin || nb > compactSizeMin
 		}
 
-		if snap, err := o.store.EncodedState(); err == nil && !bytes.Equal(lastSnap, snap) || needSnap {
+		if snap, err := o.store.EncodedState(); err == nil && (!bytes.Equal(lastSnap, snap) || needSnap) {
 			if err := n.InstallSnapshot(snap); err == nil {
 				lastSnap, lastSnapTime = snap, time.Now()
 			} else {
 				s.Warnf("Failed to install snapshot for '%s > %s > %s' [%s]: %v", o.acc.Name, ca.Stream, ca.Name, n.Group(), err)
 			}
-		}
-	}
-
-	// This is triggered during a scale up from 1 to clustered mode. We need the new followers to catchup,
-	// similar to how we trigger the catchup mechanism post a backup/restore. It's ok to do here and preferred
-	// over waiting to be elected, this just queues it up for the new members to see first and trigger the above
-	// RAFT layer catchup mechanism.
-	if sendSnapshot && o != nil {
-		if snap, err := o.store.EncodedState(); err == nil {
-			n.SendSnapshot(snap)
 		}
 	}
 
@@ -4292,9 +4318,9 @@ func (acc *Account) selectLimits(cfg *StreamConfig) (*JetStreamAccountLimits, st
 		return nil, _EMPTY_, nil, NewJSNotEnabledForAccountError()
 	}
 
-	jsa.mu.RLock()
+	jsa.usageMu.RLock()
 	selectedLimits, tierName, ok := jsa.selectLimits(cfg)
-	jsa.mu.RUnlock()
+	jsa.usageMu.RUnlock()
 
 	if !ok {
 		return nil, _EMPTY_, nil, NewJSNoLimitsError()
@@ -5223,6 +5249,10 @@ func encodeDeleteStreamAssignment(sa *streamAssignment) []byte {
 func decodeStreamAssignment(buf []byte) (*streamAssignment, error) {
 	var sa streamAssignment
 	err := json.Unmarshal(buf, &sa)
+	if err != nil {
+		return nil, err
+	}
+	fixCfgMirrorWithDedupWindow(sa.Config)
 	return &sa, err
 }
 
@@ -5260,7 +5290,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	// Make sure we have sane defaults
 	setConsumerConfigDefaults(cfg, srvLim, selectedLimits)
 
-	if err := checkConsumerCfg(cfg, srvLim, &streamCfg, acc, selectedLimits); err != nil {
+	if err := checkConsumerCfg(cfg, srvLim, &streamCfg, acc, selectedLimits, false); err != nil {
 		resp.Error = err
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
@@ -5605,10 +5635,10 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 
 	// Check here pre-emptively if we have exceeded our account limits.
 	var exceeded bool
-	jsa.mu.RLock()
+	jsa.usageMu.Lock()
 	jsaLimits, ok := jsa.limits[tierName]
 	if !ok {
-		jsa.mu.RUnlock()
+		jsa.usageMu.Unlock()
 		err := fmt.Errorf("no JetStream resource limits found account: %q", jsa.acc().Name)
 		s.RateLimitWarnf(err.Error())
 		if canRespond {
@@ -5635,7 +5665,7 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 			exceeded = true
 		}
 	}
-	jsa.mu.RUnlock()
+	jsa.usageMu.Unlock()
 
 	// If we have exceeded our account limits go ahead and return.
 	if exceeded {
@@ -5891,7 +5921,7 @@ func (mset *stream) processSnapshot(snap *streamSnapshot) (e error) {
 			o.mu.Lock()
 			if o.isLeader() {
 				// This expects mset lock to be held.
-				o.setInitialPendingAndStart()
+				o.setInitialPendingAndStart(false)
 			}
 			o.mu.Unlock()
 		}

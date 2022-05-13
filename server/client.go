@@ -2441,7 +2441,7 @@ func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForw
 		// allow = ["foo", "foo v1"]  -> can subscribe to 'foo' but can only queue subscribe to 'foo v1'
 		//
 		if sub.queue != nil {
-			if !c.canQueueSubscribe(string(sub.subject), string(sub.queue)) {
+			if !c.canSubscribe(string(sub.subject), string(sub.queue)) {
 				c.mu.Unlock()
 				c.subPermissionViolation(sub)
 				return nil, ErrSubscribePermissionViolation
@@ -2654,7 +2654,7 @@ func (c *client) addShadowSub(sub *subscription, ime *ime) (*subscription, error
 	nsub := *sub // copy
 	nsub.im = im
 
-	if !im.usePub && ime.dyn {
+	if !im.usePub && ime.dyn && im.tr != nil {
 		if im.rtr == nil {
 			im.rtr = im.tr.reverse()
 		}
@@ -2691,17 +2691,27 @@ func (c *client) addShadowSub(sub *subscription, ime *ime) (*subscription, error
 
 // canSubscribe determines if the client is authorized to subscribe to the
 // given subject. Assumes caller is holding lock.
-func (c *client) canSubscribe(subject string) bool {
+func (c *client) canSubscribe(subject string, optQueue ...string) bool {
 	if c.perms == nil {
 		return true
 	}
 
 	allowed := true
 
+	// Optional queue group.
+	var queue string
+	if len(optQueue) > 0 {
+		queue = optQueue[0]
+	}
+
 	// Check allow list. If no allow list that means all are allowed. Deny can overrule.
 	if c.perms.sub.allow != nil {
 		r := c.perms.sub.allow.Match(subject)
-		allowed = len(r.psubs) != 0
+		allowed = len(r.psubs) > 0
+		if queue != _EMPTY_ && len(r.qsubs) > 0 {
+			// If the queue appears in the allow list, then DO allow.
+			allowed = queueMatches(queue, r.qsubs)
+		}
 		// Leafnodes operate slightly differently in that they allow broader scoped subjects.
 		// They will prune based on publish perms before sending to a leafnode client.
 		if !allowed && c.kind == LEAF && subjectHasWildcard(subject) {
@@ -2713,6 +2723,11 @@ func (c *client) canSubscribe(subject string) bool {
 	if allowed && c.perms.sub.deny != nil {
 		r := c.perms.sub.deny.Match(subject)
 		allowed = len(r.psubs) == 0
+
+		if queue != _EMPTY_ && len(r.qsubs) > 0 {
+			// If the queue appears in the deny list, then DO NOT allow.
+			allowed = !queueMatches(queue, r.qsubs)
+		}
 
 		// We use the actual subscription to signal us to spin up the deny mperms
 		// and cache. We check if the subject is a wildcard that contains any of
@@ -2747,42 +2762,6 @@ func queueMatches(queue string, qsubs [][]*subscription) bool {
 		}
 	}
 	return false
-}
-
-func (c *client) canQueueSubscribe(subject, queue string) bool {
-	if c.perms == nil {
-		return true
-	}
-
-	allowed := true
-
-	if c.perms.sub.allow != nil {
-		r := c.perms.sub.allow.Match(subject)
-
-		// If perms DO NOT have queue name, then psubs will be greater than
-		// zero. If perms DO have queue name, then qsubs will be greater than
-		// zero.
-		allowed = len(r.psubs) > 0
-		if len(r.qsubs) > 0 {
-			// If the queue appears in the allow list, then DO allow.
-			allowed = queueMatches(queue, r.qsubs)
-		}
-	}
-
-	if allowed && c.perms.sub.deny != nil {
-		r := c.perms.sub.deny.Match(subject)
-
-		// If perms DO NOT have queue name, then psubs will be greater than
-		// zero. If perms DO have queue name, then qsubs will be greater than
-		// zero.
-		allowed = len(r.psubs) == 0
-		if len(r.qsubs) > 0 {
-			// If the queue appears in the deny list, then DO NOT allow.
-			allowed = !queueMatches(queue, r.qsubs)
-		}
-	}
-
-	return allowed
 }
 
 // Low level unsubscribe for a given client.
@@ -4159,7 +4138,7 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 				continue
 			}
 			if sub.im.tr != nil {
-				to, _ := sub.im.tr.transformSubject(string(dsubj))
+				to, _ := sub.im.tr.transformSubject(string(subject))
 				dsubj = append(_dsubj[:0], to...)
 			} else if sub.im.usePub {
 				dsubj = append(_dsubj[:0], subj...)
@@ -4167,8 +4146,8 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 				dsubj = append(_dsubj[:0], sub.im.to...)
 			}
 
-			// Make sure deliver is set if inbound from a route. (leaf is fixed on send)
-			if remapped && (c.kind == GATEWAY || c.kind == ROUTER) {
+			// Make sure deliver is set if inbound from a route.
+			if remapped && (c.kind == GATEWAY || c.kind == ROUTER || c.kind == LEAF) {
 				deliver = subj
 			}
 			// If we are mapping for a deliver subject we will reverse roles.
@@ -4300,12 +4279,22 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 					continue
 				}
 				if sub.im.tr != nil {
-					to, _ := sub.im.tr.transformSubject(string(subj))
+					to, _ := sub.im.tr.transformSubject(string(subject))
 					dsubj = append(_dsubj[:0], to...)
 				} else if sub.im.usePub {
 					dsubj = append(_dsubj[:0], subj...)
 				} else {
 					dsubj = append(_dsubj[:0], sub.im.to...)
+				}
+				// Make sure deliver is set if inbound from a route.
+				if remapped && (c.kind == GATEWAY || c.kind == ROUTER || c.kind == LEAF) {
+					deliver = subj
+				}
+				// If we are mapping for a deliver subject we will reverse roles.
+				// The original subj we set from above is correct for the msg header,
+				// but we need to transform the deliver subject to properly route.
+				if len(deliver) > 0 {
+					dsubj, subj = subj, dsubj
 				}
 			}
 
@@ -4674,7 +4663,7 @@ func (c *client) processSubsOnConfigReload(awcsti map[string]struct{}) {
 		// Just checking to rebuild mperms under the lock, will collect removed though here.
 		// Only collect under subs array of canSubscribe and checkAcc true.
 		canSub := c.canSubscribe(string(sub.subject))
-		canQSub := sub.queue != nil && c.canQueueSubscribe(string(sub.subject), string(sub.queue))
+		canQSub := sub.queue != nil && c.canSubscribe(string(sub.subject), string(sub.queue))
 
 		if !canSub && !canQSub {
 			removed = append(removed, sub)
