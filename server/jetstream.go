@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
-	"os"
+	goOS "os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -190,7 +190,7 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 
 	cfg := *config
 	if cfg.StoreDir == _EMPTY_ {
-		cfg.StoreDir = filepath.Join(os.TempDir(), JetStreamStoreDir)
+		cfg.StoreDir = filepath.Join(goOS.TempDir(), JetStreamStoreDir)
 	}
 
 	// We will consistently place the 'jetstream' directory under the storedir that was handed to us. Prior to 2.2.3 though
@@ -284,7 +284,7 @@ func (s *Server) checkStoreDir(cfg *JetStreamConfig) error {
 			break
 		}
 	}
-
+	os := NewFs()
 	for _, fi := range fis {
 		// Skip the 'jetstream' directory.
 		if fi.Name() == JetStreamStoreDir {
@@ -330,23 +330,7 @@ func (s *Server) enableJetStream(cfg JetStreamConfig) error {
 	s.js = js
 	s.mu.Unlock()
 
-	// FIXME(dlc) - Allow memory only operation?
-	if stat, err := os.Stat(cfg.StoreDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(cfg.StoreDir, defaultDirPerms); err != nil {
-			return fmt.Errorf("could not create storage directory - %v", err)
-		}
-	} else {
-		// Make sure its a directory and that we can write to it.
-		if stat == nil || !stat.IsDir() {
-			return fmt.Errorf("storage directory is not a directory")
-		}
-		tmpfile, err := ioutil.TempFile(cfg.StoreDir, "_test_")
-		if err != nil {
-			return fmt.Errorf("storage directory is not writable")
-		}
-		tmpfile.Close()
-		os.Remove(tmpfile.Name())
-	}
+	ensureStorageDirectory(cfg.StoreDir)
 
 	// JetStream is an internal service so we need to make sure we have a system account.
 	// This system account will export the JetStream service endpoints.
@@ -1032,17 +1016,18 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		}
 	}
 
+	os := NewFs()
 	// Clean up any old snapshots that were orphaned while staging.
-	os.RemoveAll(filepath.Join(js.config.StoreDir, snapStagingDir))
+	RemoveAll(filepath.Join(js.config.StoreDir, snapStagingDir))
 
 	sdir := filepath.Join(jsa.storeDir, streamsDir)
-	if _, err := os.Stat(sdir); os.IsNotExist(err) {
+	if _, err := os.Stat(sdir); goOS.IsNotExist(err) {
 		if err := os.MkdirAll(sdir, defaultDirPerms); err != nil {
 			return fmt.Errorf("could not create storage streams directory - %v", err)
 		}
 		// Just need to make sure we can write to the directory.
 		// Remove the directory will create later if needed.
-		os.RemoveAll(sdir)
+		RemoveAll(sdir)
 
 	} else {
 		// Restore any state here.
@@ -1067,7 +1052,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 				s.Warnf("  Error reading StreamTemplate metafile %q: %v", metasum, err)
 				continue
 			}
-			if _, err := os.Stat(metasum); os.IsNotExist(err) {
+			if _, err := os.Stat(metasum); goOS.IsNotExist(err) {
 				s.Warnf("  Missing StreamTemplate checksum for %q", metasum)
 				continue
 			}
@@ -1114,7 +1099,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		}
 		metafile := filepath.Join(mdir, JetStreamMetaFile)
 		metasum := filepath.Join(mdir, JetStreamMetaFileSum)
-		if _, err := os.Stat(metafile); os.IsNotExist(err) {
+		if _, err := os.Stat(metafile); goOS.IsNotExist(err) {
 			s.Warnf("  Missing stream metafile for %q", metafile)
 			continue
 		}
@@ -1123,7 +1108,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 			s.Warnf("  Error reading metafile %q: %v", metafile, err)
 			continue
 		}
-		if _, err := os.Stat(metasum); os.IsNotExist(err) {
+		if _, err := os.Stat(metasum); goOS.IsNotExist(err) {
 			s.Warnf("  Missing stream checksum file %q", metasum)
 			continue
 		}
@@ -1220,7 +1205,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		for _, ofi := range ofis {
 			metafile := filepath.Join(e.odir, ofi.Name(), JetStreamMetaFile)
 			metasum := filepath.Join(e.odir, ofi.Name(), JetStreamMetaFileSum)
-			if _, err := os.Stat(metafile); os.IsNotExist(err) {
+			if _, err := os.Stat(metafile); goOS.IsNotExist(err) {
 				s.Warnf("    Missing consumer metafile %q", metafile)
 				continue
 			}
@@ -1229,7 +1214,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 				s.Warnf("    Error reading consumer metafile %q: %v", metafile, err)
 				continue
 			}
-			if _, err := os.Stat(metasum); os.IsNotExist(err) {
+			if _, err := os.Stat(metasum); goOS.IsNotExist(err) {
 				s.Warnf("    Missing consumer checksum for %q", metasum)
 				continue
 			}
@@ -1277,7 +1262,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 	}
 
 	// Make sure to cleanup any old remaining snapshots.
-	os.RemoveAll(filepath.Join(jsa.storeDir, snapsDir))
+	RemoveAll(filepath.Join(jsa.storeDir, snapsDir))
 
 	s.Debugf("JetStream state for account %q recovered", a.Name)
 
@@ -2115,7 +2100,7 @@ func (s *Server) dynJetStreamConfig(storeDir string, maxStore, maxMem int64) *Je
 		jsc.StoreDir = filepath.Join(storeDir, JetStreamStoreDir)
 	} else {
 		// Create one in tmp directory, but make it consistent for restarts.
-		jsc.StoreDir = filepath.Join(os.TempDir(), "nats", JetStreamStoreDir)
+		jsc.StoreDir = filepath.Join(goOS.TempDir(), "nats", JetStreamStoreDir)
 	}
 
 	opts := s.getOpts()
