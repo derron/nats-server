@@ -330,22 +330,23 @@ func (s *Server) enableJetStream(cfg JetStreamConfig) error {
 	s.js = js
 	s.mu.Unlock()
 
-	// FIXME(dlc) - Allow memory only operation?
-	if stat, err := os.Stat(cfg.StoreDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(cfg.StoreDir, defaultDirPerms); err != nil {
-			return fmt.Errorf("could not create storage directory - %v", err)
+	if !s.opts.MemoryStorage {
+		if stat, err := os.Stat(cfg.StoreDir); os.IsNotExist(err) {
+			if err := os.MkdirAll(cfg.StoreDir, defaultDirPerms); err != nil {
+				return fmt.Errorf("could not create storage directory - %v", err)
+			}
+		} else {
+			// Make sure its a directory and that we can write to it.
+			if stat == nil || !stat.IsDir() {
+				return fmt.Errorf("storage directory is not a directory")
+			}
+			tmpfile, err := ioutil.TempFile(cfg.StoreDir, "_test_")
+			if err != nil {
+				return fmt.Errorf("storage directory is not writable")
+			}
+			tmpfile.Close()
+			os.Remove(tmpfile.Name())
 		}
-	} else {
-		// Make sure its a directory and that we can write to it.
-		if stat == nil || !stat.IsDir() {
-			return fmt.Errorf("storage directory is not a directory")
-		}
-		tmpfile, err := ioutil.TempFile(cfg.StoreDir, "_test_")
-		if err != nil {
-			return fmt.Errorf("storage directory is not writable")
-		}
-		tmpfile.Close()
-		os.Remove(tmpfile.Name())
 	}
 
 	// JetStream is an internal service so we need to make sure we have a system account.

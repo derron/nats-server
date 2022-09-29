@@ -200,6 +200,7 @@ type Options struct {
 	Host                  string        `json:"addr"`
 	Port                  int           `json:"port"`
 	DontListen            bool          `json:"dont_listen"`
+	MemoryStorage         bool          `json:"memory_storage"`
 	ClientAdvertise       string        `json:"-"`
 	Trace                 bool          `json:"-"`
 	Debug                 bool          `json:"-"`
